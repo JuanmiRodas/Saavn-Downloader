@@ -218,6 +218,20 @@ class TestSaavnStrictMatcher:
         assert match2 is None
         assert "cover" in note2.lower() or "unverified" in note2.lower()
 
+    def test_matcher_rejects_remix_live_tvsize_and_duration_mismatch(self, monkeypatch):
+        matcher = SaavnMatcher()
+        bad_candidates = [
+            SaavnMatch("r1", "Raise (Live)", ["Chilli Beans."], "Live Tour", "a1", "2024", 184, "E", True, "", language="japanese"),
+            SaavnMatch("r2", "Raise - Slowed + Reverb", ["Chilli Beans."], "Raise", "a2", "2024", 184, "E", True, "", language="japanese"),
+            SaavnMatch("r3", "Raise (TV Size)", ["Chilli Beans."], "Raise", "a3", "2024", 90, "E", True, "", language="japanese"),
+            SaavnMatch("r4", "Raise", ["Chilli Beans."], "Raise", "a4", "2024", 92, "E", True, "", language="japanese"),  # 92s vs 185s official -> rejected
+        ]
+        monkeypatch.setattr(matcher, "search_songs", lambda q, limit=6: bad_candidates)
+        monkeypatch.setattr(matcher, "check_artist_verified", lambda aid: True)
+        match, note = matcher.match_track("Raise", ["Chilli Beans."], duration_ms=185000)
+        assert match is None
+        assert "unverified" in note.lower() or "rejected" in note.lower()
+
 
 class TestArtworkAndTodoAndCatalog:
     def test_png_dimension_detection(self):
@@ -233,6 +247,54 @@ class TestArtworkAndTodoAndCatalog:
         assert detect_anime_franchise("One Piece Openings (1-29)").slug == "one-piece"
         assert detect_anime_franchise("Fullmetal Alchemist: Brotherhood OP").slug == "fullmetal-alchemist"
         assert detect_anime_franchise("ef a tale of melodies").slug == "ef-a-tale-of-melodies"
+
+    def test_autopilot_creates_anime_folder_and_master_index(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "db.json")
+            out_dir = os.path.join(tmp, "music")
+            catalog = AnimeCatalogManager(db_path=db_path)
+            # Pre-seed a scanned anime with 1 unavailable CD To-Do entry (no network needed)
+            catalog._db["animes"]["death-note"] = {
+                "last_scanned": "2026-11-25T00:00:00Z",
+                "folder_path": "",
+                "linked_playlists": [],
+                "entries": [
+                    {
+                        "entry_id": "death-note:op:1",
+                        "anime_slug": "death-note",
+                        "category": "OP",
+                        "number": 1,
+                        "label": "OP #1",
+                        "title": "the WORLD",
+                        "artist": "ナイトメア",
+                        "romanized_title": "the WORLD",
+                        "romanized_artist": "NIGHTMARE",
+                        "single_or_album": "the WORLD / アルミナ",
+                        "single_track_count": 2,
+                        "single_tracks": [],
+                        "release_date": "2006-10-18",
+                        "saavn_match": None,
+                        "saavn_note": "No verified original recording found on JioSaavn",
+                        "downloaded_files": [],
+                        "status": "todo_cd",
+                        "flags": [],
+                        "owned_from_cd": False,
+                    }
+                ],
+            }
+            catalog._save_db()
+            res = catalog.run_autopilot(
+                ["death-note"],
+                out_folder=out_dir,
+                skip_already_scanned=True,
+            )
+            assert res["processed_animes"] == 1
+            assert res["total_todo"] == 1
+            assert os.path.isdir(os.path.join(out_dir, "Death Note"))
+            assert os.path.isfile(os.path.join(out_dir, "Death Note", "CD_TODO_LIST.md"))
+            assert os.path.isfile(os.path.join(out_dir, "Death Note", "catalog.json"))
+            assert os.path.isfile(os.path.join(out_dir, "ALL_ANIMES_CD_TODO.md"))
+            assert os.path.isfile(os.path.join(out_dir, "DIRECTORY_INDEX.md"))
 
     def test_todo_export_writes_markdown_and_json(self):
         plan = {
@@ -273,7 +335,10 @@ class TestArtworkAndTodoAndCatalog:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as r:
                 assert r.status == 200
-                assert b"Saavn-Downloader Studio" in r.read()
+                body = r.read()
+                assert b"Saavn-Downloader Studio" in body
+                assert b"Run All 83 Animes" in body
+                assert b"music.youtube.com" not in body
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/animes") as r:
                 data = json.loads(r.read().decode("utf-8"))
                 assert len(data["animes"]) == 83

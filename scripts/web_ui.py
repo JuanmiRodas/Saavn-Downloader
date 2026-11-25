@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import threading
 import uuid
@@ -12,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .anime_catalog import AnimeCatalogManager, FRANCHISE_BY_SLUG
+from .anime_catalog import ANIME_FRANCHISES, AnimeCatalogManager, FRANCHISE_BY_SLUG
 from .content.spotify_playlist import SpotifyPlaylistDownloader
 from .helper import setProxy
 from .todo_exporter import build_todo_markdown, export_todo_and_plan
@@ -34,6 +35,7 @@ class AppState:
         self.out_folder = out_folder or os.getcwd()
         self.proxy_url = proxy_url or os.environ.get("http_proxy", "")
         self.jobs: dict[str, dict[str, Any]] = {}
+        self.cancel_events: dict[str, threading.Event] = {}
         self.plans: dict[str, dict[str, Any]] = {}
         self.lock = threading.Lock()
 
@@ -56,7 +58,18 @@ class AppState:
                 "result": None,
                 "error": None,
             }
+            self.cancel_events[job_id] = threading.Event()
         return job_id
+
+    def cancel_job(self, job_id: str) -> bool:
+        with self.lock:
+            ev = self.cancel_events.get(job_id)
+            if ev is not None:
+                ev.set()
+                if job_id in self.jobs:
+                    self.jobs[job_id]["message"] = "Cancelling after current anime..."
+                return True
+        return False
 
     def update_job(self, job_id: str, message: str, progress: int) -> None:
         with self.lock:
@@ -305,6 +318,140 @@ def make_handler(state: AppState):
                 dest = mgr.get_download_location(pl_name)
                 todo_path, plan_path = export_todo_and_plan(dest, plan)
                 self._send_json({"todo_path": todo_path, "plan_path": plan_path, "markdown": build_todo_markdown(plan)})
+                return
+
+            if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                job_id = path[len("/api/jobs/") : -len("/cancel")].strip("/")
+                ok = state.cancel_job(job_id)
+                self._send_json({"cancelled": ok}, 200 if ok else 404)
+                return
+
+            if path == "/api/open-folder":
+                folder = (body.get("path") or state.out_folder).strip() or state.out_folder
+                os.makedirs(folder, exist_ok=True)
+                try:
+                    if sys.platform == "darwin":
+                        subprocess.Popen(["open", folder])
+                    elif sys.platform.startswith("linux"):
+                        subprocess.Popen(["xdg-open", folder])
+                    elif sys.platform == "win32":
+                        os.startfile(folder)  # type: ignore[attr-defined]
+                    self._send_json({"opened": folder})
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if path == "/api/animes/run-all":
+                out_folder = (body.get("out_folder") or state.out_folder).strip() or state.out_folder
+                state.out_folder = out_folder
+                include_singles = bool(body.get("include_singles", True))
+                max_album_tracks = max(1, int(body.get("max_album_tracks", 6) or 6))
+                skip_scanned = bool(body.get("skip_already_scanned", False))
+                proxy_override = body.get("proxy_url")
+                if proxy_override is not None:
+                    state.proxy_url = proxy_override.strip()
+
+                slugs = body.get("slugs") or [f.slug for f in ANIME_FRANCHISES]
+                job_id = state.create_job("autopilot_all")
+                cancel_ev = state.cancel_events[job_id]
+
+                def _worker() -> None:
+                    try:
+                        proxies, headers = state.get_proxies_headers(proxy_override)
+                        catalog = AnimeCatalogManager(proxies=proxies, headers=headers)
+                        res = catalog.run_autopilot(
+                            slugs=slugs,
+                            out_folder=out_folder,
+                            include_singles=include_singles,
+                            max_album_tracks=max_album_tracks,
+                            skip_already_scanned=skip_scanned,
+                            cancel_event=cancel_ev,
+                            progress_callback=lambda msg, pct: state.update_job(job_id, msg, pct),
+                        )
+                        state.finish_job(job_id, res)
+                    except Exception as exc:
+                        state.fail_job(job_id, str(exc))
+
+                threading.Thread(target=_worker, daemon=True).start()
+                self._send_json({"job_id": job_id})
+                return
+
+            if path.startswith("/api/animes/") and path.endswith("/run"):
+                slug = path[len("/api/animes/") : -len("/run")].strip("/")
+                if slug not in FRANCHISE_BY_SLUG:
+                    self._send_json({"error": "Unknown anime"}, 404)
+                    return
+                out_folder = (body.get("out_folder") or state.out_folder).strip() or state.out_folder
+                state.out_folder = out_folder
+                include_singles = bool(body.get("include_singles", True))
+                max_album_tracks = max(1, int(body.get("max_album_tracks", 6) or 6))
+                proxy_override = body.get("proxy_url")
+                if proxy_override is not None:
+                    state.proxy_url = proxy_override.strip()
+
+                job_id = state.create_job("autopilot_one")
+                cancel_ev = state.cancel_events[job_id]
+
+                def _worker() -> None:
+                    try:
+                        proxies, headers = state.get_proxies_headers(proxy_override)
+                        catalog = AnimeCatalogManager(proxies=proxies, headers=headers)
+                        res = catalog.run_autopilot(
+                            slugs=[slug],
+                            out_folder=out_folder,
+                            include_singles=include_singles,
+                            max_album_tracks=max_album_tracks,
+                            skip_already_scanned=False,
+                            cancel_event=cancel_ev,
+                            progress_callback=lambda msg, pct: state.update_job(job_id, msg, pct),
+                        )
+                        res["gallery"] = catalog.get_anime_gallery(slug)
+                        state.finish_job(job_id, res)
+                    except Exception as exc:
+                        state.fail_job(job_id, str(exc))
+
+                threading.Thread(target=_worker, daemon=True).start()
+                self._send_json({"job_id": job_id})
+                return
+
+            if path.startswith("/api/animes/") and path.endswith("/download"):
+                slug = path[len("/api/animes/") : -len("/download")].strip("/")
+                if slug not in FRANCHISE_BY_SLUG:
+                    self._send_json({"error": "Unknown anime"}, 404)
+                    return
+                out_folder = (body.get("out_folder") or state.out_folder).strip() or state.out_folder
+                state.out_folder = out_folder
+                include_singles = bool(body.get("include_singles", True))
+                max_album_tracks = max(1, int(body.get("max_album_tracks", 6) or 6))
+                entry_ids_raw = body.get("entry_ids")
+                entry_ids = set(entry_ids_raw) if entry_ids_raw else None
+                proxy_override = body.get("proxy_url")
+                if proxy_override is not None:
+                    state.proxy_url = proxy_override.strip()
+
+                job_id = state.create_job("download_anime")
+
+                def _worker() -> None:
+                    try:
+                        proxies, headers = state.get_proxies_headers(proxy_override)
+                        catalog = AnimeCatalogManager(proxies=proxies, headers=headers)
+                        res = catalog.download_anime_entries(
+                            slug,
+                            out_folder=out_folder,
+                            include_singles=include_singles,
+                            max_album_tracks=max_album_tracks,
+                            entry_ids=entry_ids,
+                            progress_callback=lambda msg, done, tot: state.update_job(
+                                job_id, msg, int(100 * done / max(1, tot))
+                            ),
+                        )
+                        res["gallery"] = catalog.get_anime_gallery(slug)
+                        state.finish_job(job_id, res)
+                    except Exception as exc:
+                        state.fail_job(job_id, str(exc))
+
+                threading.Thread(target=_worker, daemon=True).start()
+                self._send_json({"job_id": job_id})
                 return
 
             if path.startswith("/api/animes/") and path.endswith("/scan"):

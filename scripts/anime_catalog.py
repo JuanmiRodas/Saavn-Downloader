@@ -12,7 +12,8 @@ from urllib.parse import quote
 
 import requests
 
-from .artwork_and_tags import ArtworkInfo, HighResArtworkFetcher
+from .artwork_and_tags import ArtworkInfo, HighResArtworkFetcher, write_rich_mp4_tags
+from .download_manager import Manager
 from .reference_checker import (
     OnePieceReferenceProvider,
     ReferenceSong,
@@ -60,6 +61,8 @@ class GalleryEntry:
     label: str
     title: str
     artist: str
+    romanized_title: str = ""
+    romanized_artist: str = ""
     episodes_or_context: str = ""
     single_or_album: str = ""
     single_track_count: int | None = None
@@ -71,10 +74,10 @@ class GalleryEntry:
     cover_source: str = ""
     spotify_track_url: str | None = None
     spotify_album_url: str | None = None
-    youtube_music_query_url: str = ""
     saavn_match: dict[str, Any] | None = None
     saavn_note: str = ""
-    status: str = "todo_cd"  # "ready_saavn" | "todo_cd" | "flagged_cover" | "owned_cd"
+    downloaded_files: list[str] = field(default_factory=list)
+    status: str = "todo_cd"  # "downloaded" | "ready_saavn" | "todo_cd" | "flagged_cover" | "owned_cd"
     flags: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     owned_from_cd: bool = False
@@ -400,6 +403,7 @@ class AnimeCatalogManager:
         for f in ANIME_FRANCHISES:
             rec = stored_animes.get(f.slug) or {}
             entries = rec.get("entries") or []
+            downloaded = sum(1 for e in entries if e.get("status") == "downloaded" or e.get("downloaded_files"))
             ready = sum(1 for e in entries if e.get("status") == "ready_saavn")
             owned = sum(1 for e in entries if e.get("owned_from_cd") or e.get("status") == "owned_cd")
             flagged = sum(1 for e in entries if e.get("status") == "flagged_cover")
@@ -409,7 +413,9 @@ class AnimeCatalogManager:
                     **f.to_dict(),
                     "scanned": bool(entries),
                     "last_scanned": rec.get("last_scanned"),
+                    "folder_path": rec.get("folder_path", ""),
                     "total_entries": len(entries),
+                    "downloaded": downloaded,
                     "ready_saavn": ready,
                     "todo_cd": todo,
                     "flagged_cover": flagged,
@@ -428,6 +434,7 @@ class AnimeCatalogManager:
             "franchise": franchise.to_dict(),
             "scanned": bool(rec.get("entries")),
             "last_scanned": rec.get("last_scanned"),
+            "folder_path": rec.get("folder_path", ""),
             "linked_playlists": rec.get("linked_playlists") or list(franchise.default_playlists),
             "entries": rec.get("entries") or [],
         }
@@ -441,6 +448,8 @@ class AnimeCatalogManager:
                 entry["owned_from_cd"] = bool(owned)
                 if owned:
                     entry["status"] = "owned_cd"
+                elif entry.get("downloaded_files"):
+                    entry["status"] = "downloaded"
                 else:
                     entry["status"] = (
                         "ready_saavn"
@@ -509,13 +518,40 @@ class AnimeCatalogManager:
     def _resolve_itunes_single_metadata(
         self, title: str, artist: str, artist_aliases: list[str] | None = None
     ) -> dict[str, Any]:
-        """Find the official non-OST single/album on iTunes with 3000x3000 cover and tracklist."""
+        """Find the official non-OST single/album on iTunes with 3000x3000 cover, tracklist & US romanization."""
         expected_artists = [artist, *(artist_aliases or [])]
         clean_title = strip_title_annotations(title)
         term = f"{clean_title} {artist}".strip()
 
         best_song: dict[str, Any] | None = None
         best_score = 0.0
+        romanized_title = ""
+        romanized_artist = ""
+
+        # If title or artist is Japanese/non-ASCII, query US store first to grab official romanized title/artist
+        if not term.isascii():
+            try:
+                us_resp = self.session.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": term, "entity": "song", "limit": 5, "country": "us"},
+                    timeout=10,
+                )
+                if us_resp.status_code == 200:
+                    for item in us_resp.json().get("results") or []:
+                        c_name = item.get("collectionName") or ""
+                        t_name = item.get("trackName") or ""
+                        a_name = item.get("artistName") or ""
+                        if detect_cover_or_karaoke(t_name, [a_name], album_name=c_name):
+                            continue
+                        if t_name and a_name:
+                            romanized_title = t_name
+                            romanized_artist = a_name
+                            if a_name not in expected_artists:
+                                expected_artists.append(a_name)
+                            break
+            except Exception:
+                pass
+
         for country in ("jp", "us"):
             try:
                 resp = self.session.get(
@@ -540,7 +576,11 @@ class AnimeCatalogManager:
                 artist_ok, a_score = _artist_matches([a_name], expected_artists)
                 if not artist_ok:
                     continue
-                t_score = max(_similarity(t_name, title), _similarity(t_name, clean_title))
+                t_score = max(
+                    _similarity(t_name, title),
+                    _similarity(t_name, clean_title),
+                    _similarity(t_name, romanized_title) if romanized_title else 0.0,
+                )
                 if t_score < 0.65:
                     continue
                 # Prefer singles (fewer tracks) over huge greatest-hits compilations
@@ -554,7 +594,10 @@ class AnimeCatalogManager:
                 break
 
         if not best_song:
-            return {}
+            return {
+                "romanized_title": romanized_title,
+                "romanized_artist": romanized_artist,
+            }
 
         art_100 = best_song.get("artworkUrl100") or ""
         cover_url = re.sub(r"/\d+x\d+bb\.(jpg|png)$", "/3000x3000bb.\\1", art_100) if art_100 else None
@@ -562,7 +605,7 @@ class AnimeCatalogManager:
         single_tracks: list[dict[str, Any]] = []
         label_company = ""
 
-        # Lookup full single/album tracklist if trackCount <= 12 (to keep scans snappy)
+        # Lookup full single/album tracklist if trackCount <= 12
         track_count = int(best_song.get("trackCount") or 0)
         if collection_id and track_count and track_count <= 12:
             try:
@@ -593,10 +636,13 @@ class AnimeCatalogManager:
             "single_track_count": track_count or len(single_tracks) or None,
             "single_tracks": single_tracks,
             "release_date": (best_song.get("releaseDate") or "")[:10],
+            "duration_ms": int(best_song.get("trackTimeMillis") or 0),
             "label_company": label_company,
             "cover_url": cover_url,
             "cover_resolution": "3000x3000" if cover_url else "",
             "cover_source": "itunes" if cover_url else "",
+            "romanized_title": romanized_title,
+            "romanized_artist": romanized_artist,
         }
 
     def scan_anime(
@@ -721,6 +767,11 @@ class AnimeCatalogManager:
             if len(deduped) >= max_items:
                 break
 
+        existing_downloaded = {
+            e.get("entry_id"): list(e.get("downloaded_files") or [])
+            for e in (existing_rec.get("entries") or [])
+        }
+
         def _enrich_one(idx: int, item: dict[str, Any]) -> GalleryEntry:
             cat = item.get("category", "OP")
             num = item.get("number")
@@ -738,21 +789,51 @@ class AnimeCatalogManager:
                     artist_aliases=ref.artist_aliases if ref else None,
                 )
 
+            rom_title = itunes_meta.get("romanized_title", "")
+            rom_artist = itunes_meta.get("romanized_artist", "")
+            duration_ms = int(itunes_meta.get("duration_ms") or 0)
+
+            # Build enriched ReferenceSong combining wiki + iTunes US romanized aliases for strict JioSaavn matching
+            title_aliases = list(ref.title_aliases) if ref else []
+            artist_aliases = list(ref.artist_aliases) if ref else []
+            if rom_title and rom_title not in title_aliases:
+                title_aliases.append(rom_title)
+            if rom_artist and rom_artist not in artist_aliases:
+                artist_aliases.append(rom_artist)
+            effective_ref = ReferenceSong(
+                kind=ref.kind if ref else cat.lower(),
+                number=ref.number if ref else (num or idx),
+                title=ref.title if ref else title,
+                artist=ref.artist if ref else artist,
+                episodes=ref.episodes if ref else item.get("episodes", ""),
+                title_aliases=title_aliases,
+                artist_aliases=artist_aliases,
+                source=ref.source if ref else item.get("source", "wiki"),
+            )
+
             saavn_match_dict: dict[str, Any] | None = None
             saavn_note = "Not checked"
             if check_saavn:
                 match, note = self.saavn_matcher.match_track(
                     title=title,
-                    artists=[artist],
-                    reference=ref,
+                    artists=[artist, *([rom_artist] if rom_artist else [])],
+                    duration_ms=duration_ms,
+                    reference=effective_ref,
                 )
                 saavn_match_dict = match.to_dict() if match else None
                 saavn_note = note
 
             owned = existing_owned.get(entry_id, False)
-            status = "owned_cd" if owned else ("ready_saavn" if saavn_match_dict else "todo_cd")
+            prev_dl = [p for p in existing_downloaded.get(entry_id, []) if os.path.isfile(p)]
+            if owned:
+                status = "owned_cd"
+            elif prev_dl:
+                status = "downloaded"
+            elif saavn_match_dict:
+                status = "ready_saavn"
+            else:
+                status = "todo_cd"
 
-            ytm_q = quote(f"{title} {artist}")
             return GalleryEntry(
                 entry_id=entry_id,
                 anime_slug=slug,
@@ -761,6 +842,8 @@ class AnimeCatalogManager:
                 label=label,
                 title=title,
                 artist=artist,
+                romanized_title=rom_title,
+                romanized_artist=rom_artist,
                 episodes_or_context=item.get("episodes", ""),
                 single_or_album=itunes_meta.get("single_or_album", ""),
                 single_track_count=itunes_meta.get("single_track_count"),
@@ -770,9 +853,9 @@ class AnimeCatalogManager:
                 cover_url=itunes_meta.get("cover_url") or (saavn_match_dict or {}).get("image_url"),
                 cover_resolution=itunes_meta.get("cover_resolution") or ("500x500" if saavn_match_dict else ""),
                 cover_source=itunes_meta.get("cover_source") or ("jiosaavn" if saavn_match_dict else ""),
-                youtube_music_query_url=f"https://music.youtube.com/search?q={ytm_q}",
                 saavn_match=saavn_match_dict,
                 saavn_note=saavn_note,
+                downloaded_files=prev_dl,
                 status=status,
                 owned_from_cd=owned,
                 source=item.get("source", "wiki"),
@@ -797,11 +880,341 @@ class AnimeCatalogManager:
 
         self._db.setdefault("animes", {})[slug] = {
             "last_scanned": datetime.now(timezone.utc).isoformat(),
+            "folder_path": existing_rec.get("folder_path", ""),
             "linked_playlists": existing_rec.get("linked_playlists") or list(franchise.default_playlists),
             "entries": [e.to_dict() for e in entries],
         }
         self._save_db()
         return self.get_anime_gallery(slug)
+
+    def download_anime_entries(
+        self,
+        slug: str,
+        out_folder: str,
+        *,
+        include_singles: bool = True,
+        max_album_tracks: int = 6,
+        entry_ids: set[str] | None = None,
+        progress_callback=None,
+    ) -> dict[str, Any]:
+        """Create the anime folder directory, download all verified JioSaavn tracks & eligible singles, and export CD_TODO_LIST.md."""
+        franchise = FRANCHISE_BY_SLUG.get(slug)
+        if not franchise:
+            raise ValueError(f"Unknown anime slug: {slug}")
+
+        rec = (self._db.get("animes") or {}).get(slug)
+        if not rec or not rec.get("entries"):
+            raise ValueError(f"Anime '{franchise.name}' has not been scanned yet.")
+
+        manager = Manager(out_folder=out_folder)
+        anime_dir = manager.get_download_location(manager.sanitize_name(franchise.name))
+        os.makedirs(anime_dir, exist_ok=True)
+        rec["folder_path"] = anime_dir
+
+        entries = rec.get("entries") or []
+        targets = [
+            e
+            for e in entries
+            if e.get("saavn_match")
+            and not e.get("flags")
+            and (entry_ids is None or e.get("entry_id") in entry_ids)
+        ]
+
+        downloaded_total: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        for idx, entry in enumerate(targets, start=1):
+            saavn_song = entry["saavn_match"]
+            title = entry.get("title") or saavn_song.get("title") or "Untitled"
+            artist = entry.get("artist") or ", ".join(saavn_song.get("artists") or [])
+            album_name = entry.get("single_or_album") or saavn_song.get("album") or title
+            track_count = entry.get("single_track_count")
+            release_date = entry.get("release_date") or saavn_song.get("year") or ""
+            label = entry.get("label") or ""
+            comment = (
+                f"{franchise.name} {label} ({entry['episodes_or_context']})"
+                if entry.get("episodes_or_context")
+                else f"{franchise.name} {label}"
+            ).strip()
+
+            art_info = (
+                ArtworkInfo(
+                    url=entry["cover_url"],
+                    source=entry.get("cover_source") or "itunes",
+                    width=3000 if "3000" in (entry.get("cover_resolution") or "") else 640,
+                    height=3000 if "3000" in (entry.get("cover_resolution") or "") else 640,
+                )
+                if entry.get("cover_url")
+                else None
+            )
+
+            if progress_callback:
+                progress_callback(f"Downloading {franchise.name} {label} — {title} ({idx}/{len(targets)})", idx, len(targets))
+
+            should_expand = bool(
+                include_singles
+                and track_count
+                and 1 < int(track_count) <= int(max_album_tracks)
+                and not is_soundtrack_album(album_name)
+            )
+
+            entry_files: list[str] = []
+            try:
+                cover_bytes, resolved_art = self.artwork_fetcher.download_artwork_bytes(art_info)
+                cover_res = resolved_art.resolution_label if resolved_art else (entry.get("cover_resolution") or "none")
+
+                def _dl_one(dest_dir: str, s_dict: dict[str, Any], t_title: str, t_artists: list[str], t_num: int | None, t_total: int | None) -> str:
+                    prefix = f"{t_num:02d} - " if t_num else (f"{label} - " if label else "")
+                    fname = manager.format_filename(f"{prefix}{t_title}")
+                    loc = os.path.join(dest_dir, fname)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    was_dl, bitrate = manager.start_download_with_fallback(
+                        fname, loc, s_dict["encrypted_media_url"], show_progress=False
+                    )
+                    if was_dl:
+                        write_rich_mp4_tags(
+                            loc,
+                            title=t_title,
+                            artists=t_artists or [artist],
+                            album=album_name,
+                            album_artists=[artist],
+                            track_number=t_num,
+                            total_tracks=t_total,
+                            disc_number=1,
+                            total_discs=1,
+                            release_date=release_date,
+                            genre="Anime",
+                            composers=s_dict.get("music") or None,
+                            copyright_text=entry.get("label_company") or s_dict.get("copyright_text") or s_dict.get("label") or "",
+                            comment=comment,
+                            cover_bytes=cover_bytes,
+                        )
+                    downloaded_total.append(
+                        {
+                            "file": loc,
+                            "title": t_title,
+                            "status": "downloaded" if was_dl else "already_exists",
+                            "bitrate": bitrate,
+                            "cover_resolution": cover_res,
+                        }
+                    )
+                    return loc
+
+                if should_expand:
+                    single_dir = os.path.join(
+                        anime_dir,
+                        manager.sanitize_name(f"{label} - {album_name}" if label else album_name),
+                    )
+                    # Try JioSaavn album first if same track count <= max_album_tracks
+                    saavn_alb_id = saavn_song.get("album_id")
+                    saavn_alb_songs = self.saavn_matcher.fetch_album_songs(saavn_alb_id) if saavn_alb_id else []
+                    if saavn_alb_songs and len(saavn_alb_songs) <= max_album_tracks:
+                        for t_i, s_item in enumerate(saavn_alb_songs, start=1):
+                            loc = _dl_one(
+                                single_dir,
+                                s_item.to_dict(),
+                                s_item.title,
+                                s_item.artists or [artist],
+                                t_i,
+                                len(saavn_alb_songs),
+                            )
+                            entry_files.append(loc)
+                    else:
+                        # Match each track of the official single tracklist on JioSaavn (strictly verified!)
+                        st_list = entry.get("single_tracks") or []
+                        matched_any_extra = False
+                        for st in st_list:
+                            st_title = st.get("title") or ""
+                            st_artist = st.get("artist") or artist
+                            st_num = st.get("track_number")
+                            # Main track already matched
+                            if _similarity(st_title, title) >= 0.8 or (
+                                entry.get("romanized_title") and _similarity(st_title, entry["romanized_title"]) >= 0.8
+                            ):
+                                loc = _dl_one(single_dir, saavn_song, st_title or title, [st_artist], st_num, len(st_list))
+                                entry_files.append(loc)
+                                matched_any_extra = True
+                                st["saavn_status"] = "downloaded"
+                            else:
+                                m, _ = self.saavn_matcher.match_track(
+                                    title=st_title,
+                                    artists=[st_artist, *([entry["romanized_artist"]] if entry.get("romanized_artist") else [])],
+                                    duration_ms=int(st.get("duration_ms") or 0),
+                                    allow_instrumental=True,
+                                )
+                                if m:
+                                    loc = _dl_one(single_dir, m.to_dict(), st_title, [st_artist], st_num, len(st_list))
+                                    entry_files.append(loc)
+                                    matched_any_extra = True
+                                    st["saavn_status"] = "downloaded"
+                                else:
+                                    st["saavn_status"] = "todo_cd"
+                        if not matched_any_extra:
+                            loc = _dl_one(single_dir, saavn_song, title, [artist], 1, int(track_count))
+                            entry_files.append(loc)
+                else:
+                    loc = _dl_one(anime_dir, saavn_song, title, [artist], None, None)
+                    entry_files.append(loc)
+
+                if entry_files:
+                    entry["downloaded_files"] = entry_files
+                    if not entry.get("owned_from_cd"):
+                        entry["status"] = "downloaded"
+            except Exception as exc:
+                errors.append({"entry_id": entry.get("entry_id"), "title": title, "error": str(exc)})
+
+        # Always write per-anime CD_TODO_LIST.md and catalog.json into the anime folder
+        todo_path = os.path.join(anime_dir, "CD_TODO_LIST.md")
+        with open(todo_path, "w", encoding="utf-8") as fh:
+            fh.write(self.build_master_todo_markdown(slug))
+
+        catalog_path = os.path.join(anime_dir, "catalog.json")
+        with open(catalog_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "anime": franchise.to_dict(),
+                    "folder": anime_dir,
+                    "entries": entries,
+                },
+                fh,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        self._save_db()
+        return {
+            "slug": slug,
+            "anime_name": franchise.name,
+            "folder_path": anime_dir,
+            "todo_path": todo_path,
+            "catalog_path": catalog_path,
+            "downloaded_count": len(downloaded_total),
+            "downloaded": downloaded_total,
+            "todo_count": sum(1 for e in entries if e.get("status") in ("todo_cd", "flagged_cover") and not e.get("owned_from_cd")),
+            "errors": errors,
+        }
+
+    def run_autopilot(
+        self,
+        slugs: list[str],
+        out_folder: str,
+        *,
+        include_singles: bool = True,
+        max_album_tracks: int = 6,
+        skip_already_scanned: bool = False,
+        cancel_event=None,
+        progress_callback=None,
+    ) -> dict[str, Any]:
+        """One-click autopilot: scan wikis & singles -> verify official artists on JioSaavn -> download -> create folders & CD To-Do lists."""
+        os.makedirs(out_folder, exist_ok=True)
+        total = len(slugs)
+        completed: list[dict[str, Any]] = []
+        total_downloaded = 0
+        total_todo = 0
+        cancelled = False
+
+        for idx, slug in enumerate(slugs, start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+
+            franchise = FRANCHISE_BY_SLUG.get(slug)
+            if not franchise:
+                continue
+
+            base_pct = int(100 * (idx - 1) / max(1, total))
+            rec = (self._db.get("animes") or {}).get(slug) or {}
+            already_scanned = bool(rec.get("entries"))
+
+            if not (skip_already_scanned and already_scanned):
+                if progress_callback:
+                    progress_callback(
+                        f"[{idx}/{total}] {franchise.name}: finding OPs/EDs/Movies, 3000px covers & checking JioSaavn...",
+                        base_pct,
+                    )
+                self.scan_anime(
+                    slug,
+                    check_saavn=True,
+                    enrich_itunes=True,
+                    progress_callback=lambda done, tot, f=franchise, i=idx: (
+                        progress_callback(
+                            f"[{i}/{total}] {f.name}: verifying singles & JioSaavn ({done}/{tot})...",
+                            min(99, int(100 * ((i - 1) + 0.7 * (done / max(1, tot))) / max(1, total))),
+                        )
+                        if progress_callback
+                        else None
+                    ),
+                )
+
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+
+            if progress_callback:
+                progress_callback(
+                    f"[{idx}/{total}] {franchise.name}: downloading verified JioSaavn tracks & creating folder...",
+                    min(99, int(100 * ((idx - 1) + 0.8) / max(1, total))),
+                )
+
+            res = self.download_anime_entries(
+                slug,
+                out_folder=out_folder,
+                include_singles=include_singles,
+                max_album_tracks=max_album_tracks,
+            )
+            total_downloaded += res["downloaded_count"]
+            total_todo += res["todo_count"]
+            completed.append(
+                {
+                    "slug": slug,
+                    "name": franchise.name,
+                    "folder_path": res["folder_path"],
+                    "downloaded_count": res["downloaded_count"],
+                    "todo_count": res["todo_count"],
+                    "errors": len(res["errors"]),
+                }
+            )
+
+        # Write Master CD To-Do list & Master Directory Index into out_folder
+        master_todo_path = os.path.join(out_folder, "ALL_ANIMES_CD_TODO.md")
+        with open(master_todo_path, "w", encoding="utf-8") as fh:
+            fh.write(self.build_master_todo_markdown(None))
+
+        dir_index_path = os.path.join(out_folder, "DIRECTORY_INDEX.md")
+        idx_lines = [
+            f"# Anime Music Collection Directory Index ({len(ANIME_FRANCHISES)} Series)",
+            "",
+            f"- **Root Folder:** `{out_folder}`",
+            f"- **Updated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            "",
+            "| Anime Series | Folder | Downloaded | Ready on JioSaavn | CD To-Do | Ripped from CD |",
+            "|---|---|---:|---:|---:|---:|",
+        ]
+        for s in self.list_franchises_summary():
+            folder_disp = os.path.basename(s["folder_path"]) + "/" if s.get("folder_path") else "*(not scanned)*"
+            idx_lines.append(
+                f"| {s['name']} ({s['jp_name']}) | `{folder_disp}` | {s['downloaded']} | {s['ready_saavn']} | {s['todo_cd']} | {s['owned_cd']} |"
+            )
+        idx_lines.append("")
+        with open(dir_index_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(idx_lines))
+
+        if progress_callback:
+            progress_callback(
+                "Cancelled (progress saved)" if cancelled else f"Done! Processed {len(completed)} anime series.",
+                100,
+            )
+
+        return {
+            "cancelled": cancelled,
+            "processed_animes": len(completed),
+            "total_downloaded": total_downloaded,
+            "total_todo": total_todo,
+            "out_folder": out_folder,
+            "master_todo_path": master_todo_path,
+            "directory_index_path": dir_index_path,
+            "animes": completed,
+        }
 
     def merge_spotify_plan_into_gallery(self, slug: str, plan: dict[str, Any]) -> dict[str, Any]:
         """Sync a crosschecked Spotify playlist analysis into an anime's gallery (preserving cover/metadata & CD To-Do)."""
@@ -813,6 +1226,7 @@ class AnimeCatalogManager:
             slug,
             {
                 "last_scanned": datetime.now(timezone.utc).isoformat(),
+                "folder_path": "",
                 "linked_playlists": list(franchise.default_playlists),
                 "entries": [],
             },
@@ -853,11 +1267,14 @@ class AnimeCatalogManager:
 
             prev = existing_by_id.get(entry_id) or {}
             owned = bool(prev.get("owned_from_cd", False))
+            prev_dl = list(prev.get("downloaded_files") or [])
             flags = list(ver.get("flags") or [])
             warnings = list(ver.get("warnings") or [])
 
             if owned:
                 status = "owned_cd"
+            elif prev_dl:
+                status = "downloaded"
             elif flags:
                 status = "flagged_cover"
             elif saavn:
@@ -896,9 +1313,9 @@ class AnimeCatalogManager:
                 cover_source=art.get("source", "") or prev.get("cover_source", ""),
                 spotify_track_url=None if flags else tr.get("url"),
                 spotify_album_url=None if flags else tr.get("album_url"),
-                youtube_music_query_url=f"https://music.youtube.com/search?q={quote(f'{title} {artist}')}",
                 saavn_match=saavn,
                 saavn_note=item.get("saavn_note", ""),
+                downloaded_files=prev_dl,
                 status=status,
                 flags=flags,
                 warnings=warnings,
@@ -929,6 +1346,8 @@ class AnimeCatalogManager:
                 label=ref.get("label") or f"{cat} #{num}",
                 title=title,
                 artist=artist,
+                romanized_title=itunes_meta.get("romanized_title", ""),
+                romanized_artist=itunes_meta.get("romanized_artist", ""),
                 episodes_or_context=f"Episodes {ref.get('episodes')}" if ref.get("episodes") else "",
                 single_or_album=itunes_meta.get("single_or_album", ""),
                 single_track_count=itunes_meta.get("single_track_count"),
@@ -938,7 +1357,6 @@ class AnimeCatalogManager:
                 cover_url=itunes_meta.get("cover_url"),
                 cover_resolution=itunes_meta.get("cover_resolution", ""),
                 cover_source=itunes_meta.get("cover_source", ""),
-                youtube_music_query_url=f"https://music.youtube.com/search?q={quote(f'{title} {artist}')}",
                 saavn_match=None,
                 saavn_note="Missing from Spotify playlist — added to CD To-Do",
                 status="todo_cd",
@@ -948,7 +1366,6 @@ class AnimeCatalogManager:
             )
             existing_by_id[entry_id] = entry.to_dict()
 
-        # Sort cleanly: OP ascending, then ED ascending, then Movie/Special/Character
         cat_order = {"OP": 0, "ED": 1, "Movie": 2, "Special": 3, "Insert": 4, "Character": 5}
         rec["entries"] = sorted(
             existing_by_id.values(),
@@ -959,7 +1376,7 @@ class AnimeCatalogManager:
         return self.get_anime_gallery(slug)
 
     def build_master_todo_markdown(self, slug: str | None = None) -> str:
-        """Build a CD To-Do Markdown report for a single anime or across all 41 franchises."""
+        """Build a CD To-Do Markdown report for a single anime or across all 83 series."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         slugs = [slug] if slug else [f.slug for f in ANIME_FRANCHISES]
         lines = [
@@ -986,14 +1403,15 @@ class AnimeCatalogManager:
             for e in todos:
                 alb = f" — Single/Album: `{e['single_or_album']}`" if e.get("single_or_album") else ""
                 rel = f" ({e['release_date']})" if e.get("release_date") else ""
+                rom = f" ({e['romanized_title']} / {e['romanized_artist']})" if e.get("romanized_title") and e.get("romanized_title") != e.get("title") else ""
                 reason = "; ".join(e.get("flags") or []) or e.get("saavn_note") or "Unavailable on JioSaavn"
                 lines.append(
-                    f"- [ ] **{e['label']} — {e['title']}** by **{e['artist']}**{alb}{rel}\n"
+                    f"- [ ] **{e['label']} — {e['title']}** by **{e['artist']}**{rom}{alb}{rel}\n"
                     f"  - Status: {reason}"
                 )
             lines.append("")
 
         if total_todo == 0:
-            lines.append("No pending CD To-Do items yet. Scan an anime or analyze a Spotify playlist to populate this list.")
+            lines.append("No pending CD To-Do items yet. Run Scan & Download on an anime (or Run All 83 Animes) to populate this list.")
             lines.append("")
         return "\n".join(lines)

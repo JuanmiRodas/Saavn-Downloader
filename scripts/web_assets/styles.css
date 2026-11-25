@@ -195,7 +195,71 @@ body {
 }
 .btn-ghost:hover:not(:disabled) { background: rgba(26, 25, 23, 0.05); color: var(--ink); }
 
+.btn-danger {
+  background: var(--flag);
+  color: #fff;
+}
+.btn-danger:hover:not(:disabled) { background: #962626; }
+
 .btn-sm { padding: 6px 11px; font-size: 12px; }
+
+/* Autopilot Card */
+.autopilot-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  box-shadow: var(--shadow-sm);
+}
+
+.autopilot-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.autopilot-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 19px;
+  letter-spacing: -0.02em;
+}
+
+.autopilot-cta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.field-checkbox-stack {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+}
+
+.card-saavn-note {
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  color: var(--ink-secondary);
+  line-height: 1.4;
+}
+.card-saavn-note.ok {
+  background: var(--ok-soft);
+  border-color: #bde5d1;
+  color: var(--ok);
+}
+.card-saavn-note.warn {
+  background: var(--warn-soft);
+  border-color: #f2dfb3;
+  color: var(--warn);
+}
 
 input[type="text"],
 input[type="url"],

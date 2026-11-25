@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Saavn-Downloader Studio — Spotify Verification &amp; Anime Singles Archive</title>
-  <meta name="description" content="Verify original anime openings, endings, movie themes & character singles from Spotify playlists, download from JioSaavn with highest-resolution covers, and track CD rips." />
+  <title>Saavn-Downloader Studio — 83-Anime Autopilot &amp; CD To-Do Archive</title>
+  <meta name="description" content="One-click Japanese anime openings, endings, movie singles & character song finder, strict official-artist JioSaavn downloader, highest-resolution covers, and CD To-Do archive." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet" />
@@ -17,19 +17,123 @@
         <div class="brand-mark" aria-hidden="true">♪</div>
         <div>
           <h1 class="brand-title">Saavn-Downloader Studio</h1>
-          <p class="brand-sub">Original-Artist Verification · Singles &amp; High-Res Covers · CD To-Do Archive</p>
+          <p class="brand-sub">Official-Artist Verification · Full Singles &amp; 3000px Covers · Automatic CD To-Do Folders</p>
         </div>
       </div>
       <nav class="nav-tabs" aria-label="Primary workspaces">
-        <button id="tab-playlist" class="nav-tab active" type="button" data-view="playlist">Spotify Playlist → JioSaavn</button>
-        <button id="tab-gallery" class="nav-tab" type="button" data-view="gallery">Anime Collection Gallery <span id="anime-count-badge" class="tab-count">83</span></button>
+        <button id="tab-gallery" class="nav-tab active" type="button" data-view="gallery">Anime Collection Autopilot <span id="anime-count-badge" class="tab-count">83</span></button>
+        <button id="tab-playlist" class="nav-tab" type="button" data-view="playlist">Spotify Playlist → JioSaavn</button>
       </nav>
     </div>
   </header>
 
   <main class="shell">
-    <!-- VIEW 1: SPOTIFY PLAYLIST ANALYZER & DOWNLOADER -->
-    <section id="view-playlist" class="workspace active">
+    <!-- VIEW 1 (DEFAULT): 83-ANIME AUTOPILOT GALLERY & CD TO-DO ARCHIVE -->
+    <section id="view-gallery" class="workspace active">
+      <!-- ONE-CLICK AUTOPILOT BAR -->
+      <div class="autopilot-card">
+        <div class="autopilot-head">
+          <div>
+            <h2 class="autopilot-title">One-Click Anime Collection Autopilot</h2>
+            <p class="muted" style="margin:2px 0 0">Finds official Japanese OPs, EDs, Movie &amp; Character singles (no OSTs/covers/remixes), verifies original artists on JioSaavn, downloads available songs/singles with 3000px covers, creates every anime folder, and logs unavailable songs to your CD To-Do lists.</p>
+          </div>
+          <div class="autopilot-cta">
+            <button id="btn-run-all" class="btn btn-primary" type="button">⚡ Run All 83 Animes</button>
+            <button id="btn-stop-job" class="btn btn-danger hidden" type="button">Stop After Current</button>
+            <button id="btn-open-root-folder" class="btn btn-secondary" type="button">Open Folder in Finder</button>
+          </div>
+        </div>
+
+        <div class="options-grid" style="margin-top:14px;padding-top:14px">
+          <div class="field">
+            <label for="gal-out-folder">Collection Root Folder</label>
+            <input id="gal-out-folder" type="text" placeholder="~/Music/Saavn-Downloader" />
+          </div>
+          <div class="field">
+            <label for="gal-max-tracks">Max Single Tracks to Expand</label>
+            <input id="gal-max-tracks" type="number" min="1" max="50" value="6" />
+            <span class="field-hint">Singles ≤ max download all tracks into subfolder · Larger albums = theme song only</span>
+          </div>
+          <div class="field">
+            <label for="gal-proxy-url">JioSaavn Proxy (Optional)</label>
+            <input id="gal-proxy-url" type="text" placeholder="http://proxy:port (optional)" />
+          </div>
+          <div class="field field-checkbox-stack">
+            <label class="check-inline">
+              <input id="gal-include-singles" type="checkbox" checked />
+              <span>Download full singles (up to max tracks)</span>
+            </label>
+            <label class="check-inline">
+              <input id="gal-skip-scanned" type="checkbox" />
+              <span>Skip already-scanned animes when running all</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="gallery-progress" class="progress-panel hidden" style="margin-top:14px" role="status" aria-live="polite">
+          <div class="progress-head">
+            <span id="gallery-progress-msg">Working...</span>
+            <span id="gallery-progress-pct" class="mono">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="gallery-progress-fill" class="progress-fill" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div id="autopilot-summary" class="download-summary hidden"></div>
+      </div>
+
+      <div class="gallery-layout" style="margin-top:18px">
+        <aside class="anime-sidebar">
+          <div class="sidebar-head">
+            <input id="anime-search" class="sidebar-search" type="search" placeholder="Filter 83 anime series..." />
+            <div class="sidebar-actions">
+              <button id="btn-master-todo" class="btn btn-secondary btn-sm" type="button">Preview / Export Master CD To-Do (.md)</button>
+            </div>
+          </div>
+          <div id="anime-list" class="anime-list" role="listbox" aria-label="Anime series catalog"></div>
+        </aside>
+
+        <div class="gallery-stage">
+          <div class="gallery-header">
+            <div style="flex:1;min-width:240px">
+              <div class="gallery-title-row">
+                <h2 id="gal-title">Select an Anime Series</h2>
+                <span id="gal-jp" class="jp-subtitle"></span>
+              </div>
+              <p id="gal-notes" class="muted" style="margin:4px 0 0"></p>
+              <p id="gal-folder-path" class="mono muted" style="margin:6px 0 0"></p>
+            </div>
+            <div class="gallery-header-actions">
+              <button id="btn-run-anime" class="btn btn-primary" type="button">▶ Scan &amp; Download This Anime</button>
+              <button id="btn-download-anime" class="btn btn-secondary" type="button">Download Available</button>
+              <button id="btn-open-anime-folder" class="btn btn-secondary" type="button">Open Folder</button>
+              <button id="btn-anime-todo" class="btn btn-secondary" type="button">CD To-Do (.md)</button>
+            </div>
+          </div>
+
+          <div class="table-toolbar">
+            <div class="filter-pills" id="gallery-filters">
+              <button class="pill active" type="button" data-gfilter="all">All</button>
+              <button class="pill" type="button" data-gfilter="OP">Openings</button>
+              <button class="pill" type="button" data-gfilter="ED">Endings</button>
+              <button class="pill" type="button" data-gfilter="Movie">Movies</button>
+              <button class="pill" type="button" data-gfilter="Character">Character / Insert</button>
+              <button class="pill" type="button" data-gfilter="downloaded">Downloaded ✓</button>
+              <button class="pill" type="button" data-gfilter="ready_saavn">On JioSaavn</button>
+              <button class="pill" type="button" data-gfilter="todo_cd">CD To-Do</button>
+              <button class="pill" type="button" data-gfilter="owned_cd">Ripped from CD ✓</button>
+            </div>
+            <span id="gal-count-note" class="mono muted"></span>
+          </div>
+
+          <div id="gallery-grid" class="gallery-grid"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 2: SPOTIFY PLAYLIST ANALYZER & DOWNLOADER -->
+    <section id="view-playlist" class="workspace">
       <div class="control-card">
         <div class="url-row">
           <label class="sr-only" for="spotify-url">Spotify Playlist or Album URL</label>
@@ -79,14 +183,13 @@
           </div>
           <div class="field field-checkbox">
             <label class="check-inline">
-              <input id="strict-versions" type="checkbox" />
+              <input id="strict-versions" type="checkbox" checked />
               <span>Flag alternate / re-recorded versions by original artist</span>
             </label>
           </div>
         </div>
       </div>
 
-      <!-- Progress bar -->
       <div id="playlist-progress" class="progress-panel hidden" role="status" aria-live="polite">
         <div class="progress-head">
           <span id="playlist-progress-msg">Working...</span>
@@ -97,7 +200,6 @@
         </div>
       </div>
 
-      <!-- Results Stage -->
       <div id="playlist-results" class="hidden">
         <div class="playlist-banner">
           <img id="pl-cover" class="pl-cover" alt="" />
@@ -142,7 +244,6 @@
           </div>
         </div>
 
-        <!-- Missing Official Themes Callout -->
         <div id="missing-panel" class="missing-panel hidden">
           <div class="missing-head">
             <h3>Missing Official Themes (Not in Spotify Playlist → Added to CD To-Do)</h3>
@@ -150,7 +251,6 @@
           <ul id="missing-list" class="missing-list"></ul>
         </div>
 
-        <!-- Filter & Selection Toolbar -->
         <div class="table-toolbar">
           <div class="filter-pills" id="track-filters">
             <button class="pill active" type="button" data-filter="all">All</button>
@@ -183,65 +283,6 @@
         </div>
 
         <div id="download-summary" class="download-summary hidden"></div>
-      </div>
-    </section>
-
-    <!-- VIEW 2: 83-ANIME COLLECTION GALLERY & CD TO-DO ARCHIVE -->
-    <section id="view-gallery" class="workspace">
-      <div class="gallery-layout">
-        <aside class="anime-sidebar">
-          <div class="sidebar-head">
-            <input id="anime-search" class="sidebar-search" type="search" placeholder="Filter 83 anime series..." />
-            <div class="sidebar-actions">
-              <button id="btn-master-todo" class="btn btn-secondary btn-sm" type="button">Export Master CD To-Do (.md)</button>
-            </div>
-          </div>
-          <div id="anime-list" class="anime-list" role="listbox" aria-label="Anime series catalog"></div>
-        </aside>
-
-        <div class="gallery-stage">
-          <div class="gallery-header">
-            <div>
-              <div class="gallery-title-row">
-                <h2 id="gal-title">Select an Anime Series</h2>
-                <span id="gal-jp" class="jp-subtitle"></span>
-              </div>
-              <p id="gal-notes" class="muted"></p>
-            </div>
-            <div class="gallery-header-actions">
-              <button id="btn-scan-anime" class="btn btn-primary" type="button">Scan Wikis, Singles &amp; 3000px Covers</button>
-              <button id="btn-anime-todo" class="btn btn-secondary" type="button">Export Anime CD To-Do</button>
-            </div>
-          </div>
-
-          <div id="gal-playlists-bar" class="linked-playlists hidden"></div>
-
-          <div id="gallery-progress" class="progress-panel hidden" role="status" aria-live="polite">
-            <div class="progress-head">
-              <span id="gallery-progress-msg">Scanning...</span>
-              <span id="gallery-progress-pct" class="mono">0%</span>
-            </div>
-            <div class="progress-track">
-              <div id="gallery-progress-fill" class="progress-fill" style="width: 0%"></div>
-            </div>
-          </div>
-
-          <div class="table-toolbar">
-            <div class="filter-pills" id="gallery-filters">
-              <button class="pill active" type="button" data-gfilter="all">All</button>
-              <button class="pill" type="button" data-gfilter="OP">Openings</button>
-              <button class="pill" type="button" data-gfilter="ED">Endings</button>
-              <button class="pill" type="button" data-gfilter="Movie">Movies</button>
-              <button class="pill" type="button" data-gfilter="Character">Character / Insert</button>
-              <button class="pill" type="button" data-gfilter="ready_saavn">Ready on JioSaavn</button>
-              <button class="pill" type="button" data-gfilter="todo_cd">CD To-Do</button>
-              <button class="pill" type="button" data-gfilter="owned_cd">Ripped from CD ✓</button>
-            </div>
-            <span id="gal-count-note" class="mono muted"></span>
-          </div>
-
-          <div id="gallery-grid" class="gallery-grid"></div>
-        </div>
       </div>
     </section>
   </main>

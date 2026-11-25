@@ -9,6 +9,7 @@
     galleryFilter: "all",
     currentTodoMarkdown: "",
     currentTodoDownloadUrl: "",
+    activeJobId: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -18,7 +19,7 @@
     el.textContent = msg;
     el.classList.remove("hidden");
     clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => el.classList.add("hidden"), 3400);
+    showToast._t = setTimeout(() => el.classList.add("hidden"), 3800);
   }
 
   function escapeHtml(str) {
@@ -49,6 +50,18 @@
     }
   }
 
+  async function openFolderInFinder(folderPath) {
+    try {
+      const data = await apiJson("/api/open-folder", {
+        method: "POST",
+        body: JSON.stringify({ path: folderPath || $("gal-out-folder").value.trim() }),
+      });
+      showToast(`Opened ${data.opened}`);
+    } catch (err) {
+      showToast(`Could not open folder: ${err.message}`);
+    }
+  }
+
   // Tabs
   document.querySelectorAll(".nav-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -56,13 +69,424 @@
       document.querySelectorAll(".workspace").forEach((w) => w.classList.remove("active"));
       btn.classList.add("active");
       $(`view-${btn.dataset.view}`).classList.add("active");
-      if (btn.dataset.view === "gallery" && state.animes.length === 0) {
-        loadAnimesList();
+      if (btn.dataset.view === "gallery") {
+        loadAnimesList(false);
       }
     });
   });
 
-  // Preset buttons
+  // Keep output folder & proxy synced between both tabs
+  $("gal-out-folder").addEventListener("input", () => {
+    $("out-folder").value = $("gal-out-folder").value;
+  });
+  $("out-folder").addEventListener("input", () => {
+    $("gal-out-folder").value = $("out-folder").value;
+  });
+  $("gal-proxy-url").addEventListener("input", () => {
+    $("proxy-url").value = $("gal-proxy-url").value;
+  });
+  $("proxy-url").addEventListener("input", () => {
+    $("gal-proxy-url").value = $("proxy-url").value;
+  });
+
+  // ======================== VIEW 1: 83-ANIME AUTOPILOT GALLERY ========================
+  async function loadAnimesList(openSelected = true) {
+    const data = await apiJson("/api/animes");
+    state.animes = data.animes || [];
+    $("anime-count-badge").textContent = String(state.animes.length);
+    renderAnimeSidebar();
+    if (openSelected && state.currentAnimeSlug) {
+      await selectAnime(state.currentAnimeSlug);
+    }
+  }
+
+  function renderAnimeSidebar() {
+    const q = ($("anime-search").value || "").toLowerCase().trim();
+    const filtered = state.animes.filter(
+      (a) =>
+        !q ||
+        a.name.toLowerCase().includes(q) ||
+        (a.jp_name || "").toLowerCase().includes(q) ||
+        (a.aliases || []).some((al) => al.toLowerCase().includes(q))
+    );
+    $("anime-list").innerHTML = filtered
+      .map((a) => {
+        const active = a.slug === state.currentAnimeSlug ? "active" : "";
+        const okCount = (a.downloaded || 0) + (a.ready_saavn || 0) + (a.owned_cd || 0);
+        const pills = a.scanned
+          ? `<span class="badge badge-ok" title="Downloaded / Ready / Owned">${okCount}</span><span class="badge badge-warn" title="CD To-Do">${a.todo_cd}</span>`
+          : `<span class="badge badge-neutral">Pending</span>`;
+        return `
+          <button class="anime-item ${active}" type="button" data-slug="${escapeHtml(a.slug)}">
+            <div>
+              <span class="anime-item-name">${escapeHtml(a.name)}</span>
+              <span class="anime-item-jp">${escapeHtml(a.jp_name)}</span>
+            </div>
+            <div class="anime-item-pills">${pills}</div>
+          </button>
+        `;
+      })
+      .join("");
+
+    $("anime-list").querySelectorAll(".anime-item").forEach((btn) => {
+      btn.addEventListener("click", () => selectAnime(btn.dataset.slug));
+    });
+  }
+
+  $("anime-search").addEventListener("input", renderAnimeSidebar);
+
+  async function selectAnime(slug) {
+    state.currentAnimeSlug = slug;
+    renderAnimeSidebar();
+    const gallery = await apiJson(`/api/animes/${slug}`);
+    state.currentGallery = gallery;
+    renderGalleryStage();
+  }
+
+  function setAutopilotBusy(busy, jobId = null) {
+    state.activeJobId = busy ? jobId : null;
+    $("btn-run-all").disabled = busy;
+    $("btn-run-anime").disabled = busy;
+    $("btn-download-anime").disabled = busy;
+    if (busy && jobId) {
+      $("btn-stop-job").classList.remove("hidden");
+      $("gallery-progress").classList.remove("hidden");
+    } else {
+      $("btn-stop-job").classList.add("hidden");
+    }
+  }
+
+  function renderGalleryStage() {
+    const gal = state.currentGallery;
+    if (!gal) return;
+    const f = gal.franchise;
+    $("gal-title").textContent = f.name;
+    $("gal-jp").textContent = f.jp_name;
+    $("gal-notes").textContent = `${f.notes} · Official Japanese originals only (soundtracks, covers & remixes rejected)`;
+
+    const rootDir = $("gal-out-folder").value.trim() || ".";
+    const folderPath = gal.folder_path || `${rootDir}/${f.name}`;
+    $("gal-folder-path").textContent = `Folder: ${folderPath}/`;
+
+    const entries = gal.entries || [];
+    const availableCount = entries.filter((e) => e.saavn_match && !e.flags?.length).length;
+    $("btn-download-anime").disabled = availableCount === 0 || Boolean(state.activeJobId);
+    $("btn-download-anime").textContent = availableCount > 0 ? `Download Available (${availableCount})` : "No JioSaavn Matches";
+
+    const filtered = entries.filter((e) => {
+      if (state.galleryFilter === "all") return true;
+      if (["OP", "ED", "Movie"].includes(state.galleryFilter)) return e.category === state.galleryFilter;
+      if (state.galleryFilter === "Character") return ["Character", "Insert", "Special"].includes(e.category);
+      return e.status === state.galleryFilter;
+    });
+
+    $("gal-count-note").textContent = `${filtered.length} of ${entries.length} singles / themes`;
+
+    const grid = $("gallery-grid");
+    if (entries.length === 0) {
+      grid.innerHTML = `
+        <div class="empty-state">
+          <p><strong>${escapeHtml(f.name)}</strong> hasn't been processed yet.</p>
+          <p class="muted">Click <strong>"▶ Scan &amp; Download This Anime"</strong> (or <strong>"⚡ Run All 83 Animes"</strong> above) to find all official openings, endings, movie &amp; character singles, verify original artists on JioSaavn, download all available tracks with 3000px covers into <code>${escapeHtml(folderPath)}/</code>, and flag unavailable songs to your CD To-Do list.</p>
+        </div>
+      `;
+      return;
+    }
+
+    if (filtered.length === 0) {
+      grid.innerHTML = `<div class="empty-state">No entries match the current filter.</div>`;
+      return;
+    }
+
+    const maxTracks = Math.max(1, parseInt($("gal-max-tracks").value || "6", 10));
+
+    grid.innerHTML = filtered
+      .map((e) => {
+        const statusMap = {
+          downloaded: ["badge-ok", "Downloaded ✓"],
+          ready_saavn: ["badge-ok", "Official on JioSaavn"],
+          todo_cd: ["badge-warn", "CD To-Do"],
+          flagged_cover: ["badge-flag", "Cover Rejected · CD To-Do"],
+          owned_cd: ["badge-ok", "Ripped from CD ✓"],
+        };
+        const [stCls, stLbl] = statusMap[e.status] || ["badge-neutral", e.status];
+
+        const artHtml = e.cover_url
+          ? `<img class="card-art-img" src="${escapeHtml(e.cover_url)}" alt="${escapeHtml(e.title)}" loading="lazy" />
+             ${e.cover_resolution ? `<span class="card-res-badge">${escapeHtml(e.cover_resolution)} ${escapeHtml(e.cover_source || "")}</span>` : ""}`
+          : `<div class="card-art-sleeve">
+               <span class="sleeve-cat">${escapeHtml(f.name)} · ${escapeHtml(e.label)}</span>
+               <div class="sleeve-title">${escapeHtml(e.title)}</div>
+               <div class="sleeve-artist">${escapeHtml(e.artist)}</div>
+             </div>`;
+
+        const romSubtitle =
+          e.romanized_title && e.romanized_title.toLowerCase() !== (e.title || "").toLowerCase()
+            ? `<div class="card-meta">${escapeHtml(e.romanized_title)}${e.romanized_artist ? ` · ${escapeHtml(e.romanized_artist)}` : ""}</div>`
+            : "";
+
+        const tCount = e.single_track_count;
+        const willExpand = tCount && tCount > 1 && tCount <= maxTracks;
+        const singleBadge = tCount
+          ? `<span class="badge ${willExpand ? "badge-accent" : "badge-neutral"}">${willExpand ? `Full Single (${tCount}t)` : `${tCount}t (Song Only)`}</span>`
+          : "";
+
+        let saavnBox = "";
+        if (e.status === "downloaded" && (e.downloaded_files || []).length > 0) {
+          saavnBox = `<div class="card-saavn-note ok">✓ Saved ${e.downloaded_files.length} file(s) from JioSaavn (verified official artist)</div>`;
+        } else if (e.saavn_match) {
+          const sm = e.saavn_match;
+          saavnBox = `<div class="card-saavn-note ok">✓ JioSaavn: <strong>${escapeHtml(sm.title)}</strong> — ${escapeHtml((sm.artists || []).join(", "))}${sm.is_320kbps ? " · 320kbps" : ""}</div>`;
+        } else {
+          saavnBox = `<div class="card-saavn-note warn">${escapeHtml(e.saavn_note || "Not available as an official original on JioSaavn → Added to CD To-Do")}</div>`;
+        }
+
+        const singleTracks = e.single_tracks || [];
+        const tracksDrawer = singleTracks.length
+          ? `<details class="card-single-tracks">
+               <summary>Single tracklist (${singleTracks.length} tracks)</summary>
+               <ol>${singleTracks
+                 .map((st) => {
+                   const tag = st.saavn_status === "downloaded" ? " ✓" : st.saavn_status === "todo_cd" ? " (CD)" : "";
+                   return `<li>${escapeHtml(st.title)}${tag}</li>`;
+                 })
+                 .join("")}</ol>
+             </details>`
+          : "";
+
+        const dlBtnHtml =
+          e.saavn_match && !(e.flags || []).length
+            ? `<button class="btn btn-primary btn-sm dl-entry-btn" type="button" data-entry="${escapeHtml(e.entry_id)}">${e.status === "downloaded" ? "Re-Download" : "Download"}</button>`
+            : "";
+
+        const saavnLink =
+          e.saavn_match && e.saavn_match.perma_url
+            ? `<a class="link-pill" href="${escapeHtml(e.saavn_match.perma_url)}" target="_blank" rel="noopener">JioSaavn</a>`
+            : "";
+
+        return `
+          <article class="album-card">
+            <div class="card-art-box">
+              ${artHtml}
+              <div class="card-top-badges">
+                <span class="badge badge-neutral" style="background:rgba(255,255,255,0.92)">${escapeHtml(e.label)}</span>
+                <span class="badge ${stCls}">${stLbl}</span>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="card-title">${escapeHtml(e.title)}</div>
+              <div class="card-artist">${escapeHtml(e.artist)}</div>
+              ${romSubtitle}
+              <div class="card-meta" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:2px">
+                <span>${e.single_or_album ? escapeHtml(e.single_or_album) : "Single metadata pending"}${e.release_date ? ` · ${escapeHtml(e.release_date)}` : ""}</span>
+                ${singleBadge}
+              </div>
+              ${e.episodes_or_context ? `<div class="card-meta">${escapeHtml(e.episodes_or_context)}</div>` : ""}
+              ${saavnBox}
+              ${tracksDrawer}
+              <div class="card-footer">
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  ${dlBtnHtml}
+                  <button class="btn btn-secondary btn-sm toggle-cd-btn" type="button" data-entry="${escapeHtml(e.entry_id)}" data-owned="${e.owned_from_cd ? "1" : "0"}">
+                    ${e.owned_from_cd ? "✓ Ripped (Undo)" : "Mark Ripped"}
+                  </button>
+                </div>
+                <div class="card-links">${saavnLink}</div>
+              </div>
+            </div>
+          </article>
+        `;
+      })
+      .join("");
+
+    grid.querySelectorAll(".toggle-cd-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const nextOwned = btn.dataset.owned !== "1";
+        await apiJson(`/api/animes/${state.currentAnimeSlug}/toggle-cd`, {
+          method: "POST",
+          body: JSON.stringify({ entry_id: btn.dataset.entry, owned: nextOwned }),
+        });
+        await selectAnime(state.currentAnimeSlug);
+        loadAnimesList(false);
+      });
+    });
+
+    grid.querySelectorAll(".dl-entry-btn").forEach((btn) => {
+      btn.addEventListener("click", () => downloadCurrentAnime([btn.dataset.entry]));
+    });
+  }
+
+  $("gallery-filters").querySelectorAll(".pill").forEach((p) => {
+    p.addEventListener("click", () => {
+      $("gallery-filters").querySelectorAll(".pill").forEach((x) => x.classList.remove("active"));
+      p.classList.add("active");
+      state.galleryFilter = p.dataset.gfilter;
+      renderGalleryStage();
+    });
+  });
+
+  $("gal-max-tracks").addEventListener("input", () => state.currentGallery && renderGalleryStage());
+
+  async function downloadCurrentAnime(entryIds = null) {
+    const slug = state.currentAnimeSlug;
+    if (!slug) return;
+    try {
+      const { job_id } = await apiJson(`/api/animes/${slug}/download`, {
+        method: "POST",
+        body: JSON.stringify({
+          out_folder: $("gal-out-folder").value.trim(),
+          include_singles: $("gal-include-singles").checked,
+          max_album_tracks: parseInt($("gal-max-tracks").value || "6", 10),
+          proxy_url: $("gal-proxy-url").value.trim(),
+          entry_ids: entryIds,
+        }),
+      });
+      setAutopilotBusy(true, job_id);
+      const res = await pollJob(job_id, (msg, pct) => {
+        $("gallery-progress-msg").textContent = msg;
+        $("gallery-progress-pct").textContent = `${pct}%`;
+        $("gallery-progress-fill").style.width = `${pct}%`;
+      });
+      if (res.gallery) {
+        state.currentGallery = res.gallery;
+        renderGalleryStage();
+      }
+      await loadAnimesList(false);
+      showToast(`Downloaded ${res.downloaded_count} file(s) into ${res.folder_path}`);
+    } catch (err) {
+      showToast(`Download error: ${err.message}`);
+    } finally {
+      setAutopilotBusy(false);
+      setTimeout(() => $("gallery-progress").classList.add("hidden"), 1000);
+    }
+  }
+
+  // One-click: Scan & Download CURRENT anime + create folder + CD To-Do
+  $("btn-run-anime").addEventListener("click", async () => {
+    const slug = state.currentAnimeSlug;
+    if (!slug) return;
+    $("autopilot-summary").classList.add("hidden");
+    try {
+      const { job_id } = await apiJson(`/api/animes/${slug}/run`, {
+        method: "POST",
+        body: JSON.stringify({
+          out_folder: $("gal-out-folder").value.trim(),
+          include_singles: $("gal-include-singles").checked,
+          max_album_tracks: parseInt($("gal-max-tracks").value || "6", 10),
+          proxy_url: $("gal-proxy-url").value.trim(),
+        }),
+      });
+      setAutopilotBusy(true, job_id);
+      const res = await pollJob(job_id, (msg, pct) => {
+        $("gallery-progress-msg").textContent = msg;
+        $("gallery-progress-pct").textContent = `${pct}%`;
+        $("gallery-progress-fill").style.width = `${pct}%`;
+      });
+      if (res.gallery) {
+        state.currentGallery = res.gallery;
+        renderGalleryStage();
+      }
+      await loadAnimesList(false);
+      const aInfo = (res.animes || [])[0];
+      const sum = $("autopilot-summary");
+      sum.classList.remove("hidden");
+      sum.innerHTML =
+        `<strong>${escapeHtml(aInfo?.name || slug)} complete!</strong> ` +
+        `Downloaded <strong>${res.total_downloaded}</strong> verified track(s), flagged <strong>${res.total_todo}</strong> song(s) to CD To-Do. ` +
+        `Folder created at <code>${escapeHtml(aInfo?.folder_path || res.out_folder)}</code>.`;
+      showToast(`Done: ${res.total_downloaded} downloaded, ${res.total_todo} CD To-Do`);
+    } catch (err) {
+      showToast(`Error: ${err.message}`);
+    } finally {
+      setAutopilotBusy(false);
+      setTimeout(() => $("gallery-progress").classList.add("hidden"), 1000);
+    }
+  });
+
+  // One-click: Run ALL 83 ANIMES!
+  $("btn-run-all").addEventListener("click", async () => {
+    $("autopilot-summary").classList.add("hidden");
+    try {
+      const { job_id } = await apiJson("/api/animes/run-all", {
+        method: "POST",
+        body: JSON.stringify({
+          out_folder: $("gal-out-folder").value.trim(),
+          include_singles: $("gal-include-singles").checked,
+          max_album_tracks: parseInt($("gal-max-tracks").value || "6", 10),
+          skip_already_scanned: $("gal-skip-scanned").checked,
+          proxy_url: $("gal-proxy-url").value.trim(),
+        }),
+      });
+      setAutopilotBusy(true, job_id);
+      const res = await pollJob(job_id, (msg, pct) => {
+        $("gallery-progress-msg").textContent = msg;
+        $("gallery-progress-pct").textContent = `${pct}%`;
+        $("gallery-progress-fill").style.width = `${pct}%`;
+      });
+      await loadAnimesList(true);
+      const sum = $("autopilot-summary");
+      sum.classList.remove("hidden");
+      sum.innerHTML =
+        `<strong>${res.cancelled ? "Stopped (progress saved)" : "All 83 Animes Complete!"}</strong> ` +
+        `Processed <strong>${res.processed_animes}</strong> series · Downloaded <strong>${res.total_downloaded}</strong> verified track(s) · ` +
+        `Flagged <strong>${res.total_todo}</strong> song(s) to <code>${escapeHtml(res.master_todo_path)}</code> · ` +
+        `Directory index at <code>${escapeHtml(res.directory_index_path)}</code>.`;
+      showToast(`Processed ${res.processed_animes} anime series`);
+    } catch (err) {
+      showToast(`Autopilot error: ${err.message}`);
+    } finally {
+      setAutopilotBusy(false);
+      setTimeout(() => $("gallery-progress").classList.add("hidden"), 1200);
+    }
+  });
+
+  $("btn-stop-job").addEventListener("click", async () => {
+    if (!state.activeJobId) return;
+    await apiJson(`/api/jobs/${state.activeJobId}/cancel`, { method: "POST" });
+    showToast("Stopping after current anime finishes (progress will be saved)...");
+  });
+
+  $("btn-download-anime").addEventListener("click", () => downloadCurrentAnime(null));
+  $("btn-open-root-folder").addEventListener("click", () => openFolderInFinder($("gal-out-folder").value.trim()));
+  $("btn-open-anime-folder").addEventListener("click", () => {
+    const f = state.currentGallery?.franchise;
+    const path = state.currentGallery?.folder_path || (f ? `${$("gal-out-folder").value.trim()}/${f.name}` : "");
+    openFolderInFinder(path);
+  });
+
+  async function openTodoModal(markdown, downloadUrl) {
+    state.currentTodoMarkdown = markdown;
+    state.currentTodoDownloadUrl = downloadUrl;
+    $("todo-markdown-preview").textContent = markdown;
+    $("todo-modal").classList.remove("hidden");
+  }
+
+  $("btn-anime-todo").addEventListener("click", async () => {
+    if (!state.currentAnimeSlug) return;
+    const url = `/api/animes/${state.currentAnimeSlug}/todo.md`;
+    const md = await (await fetch(url)).text();
+    openTodoModal(md, url);
+  });
+
+  $("btn-master-todo").addEventListener("click", async () => {
+    const url = `/api/animes/all/todo.md`;
+    const md = await (await fetch(url)).text();
+    openTodoModal(md, url);
+  });
+
+  // Modal controls
+  document.querySelectorAll("[data-close-modal]").forEach((el) => {
+    el.addEventListener("click", () => $("todo-modal").classList.add("hidden"));
+  });
+  $("btn-copy-todo").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(state.currentTodoMarkdown);
+    showToast("Copied CD To-Do Markdown to clipboard");
+  });
+  $("btn-download-todo-md").addEventListener("click", () => {
+    if (state.currentTodoDownloadUrl) window.location.href = state.currentTodoDownloadUrl;
+  });
+
+  // ======================== VIEW 2: SPOTIFY PLAYLIST -> JIOSAAVN ========================
   document.querySelectorAll(".preset-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       $("spotify-url").value = btn.dataset.url;
@@ -119,7 +543,6 @@
     $("kpi-missing").textContent = String(plan.summary.missing_official_themes);
     $("kpi-expand").textContent = String(expandCount);
 
-    // Missing official themes
     const missing = plan.missing_references || [];
     if (missing.length > 0) {
       $("missing-panel").classList.remove("hidden");
@@ -135,7 +558,6 @@
       $("missing-panel").classList.add("hidden");
     }
 
-    // Filter rows
     const tbody = $("tracks-tbody");
     const filtered = items.filter((it) => {
       const st = it.verification.status;
@@ -269,9 +691,7 @@
       );
       renderPlaylistPlan();
       showToast(`Analyzed "${plan.playlist.name}" (${plan.summary.total_tracks} tracks)`);
-      if (state.animes.length > 0 && plan.detected_anime_slug) {
-        loadAnimesList(false);
-      }
+      if (plan.detected_anime_slug) loadAnimesList(false);
     } catch (err) {
       showToast(`Error: ${err.message}`);
     } finally {
@@ -285,11 +705,9 @@
     if (e.key === "Enter") runAnalyze();
   });
 
-  // Live update expansion pills when mode or max tracks changes!
   $("dl-mode").addEventListener("change", () => state.currentPlan && renderPlaylistPlan());
   $("max-album-tracks").addEventListener("input", () => state.currentPlan && renderPlaylistPlan());
 
-  // Track filters
   $("track-filters").querySelectorAll(".pill").forEach((p) => {
     p.addEventListener("click", () => {
       $("track-filters").querySelectorAll(".pill").forEach((x) => x.classList.remove("active"));
@@ -311,14 +729,6 @@
     state.selectedPositions.clear();
     renderPlaylistPlan();
   });
-
-  // Preview / Export CD To-Do
-  async function openTodoModal(markdown, downloadUrl) {
-    state.currentTodoMarkdown = markdown;
-    state.currentTodoDownloadUrl = downloadUrl;
-    $("todo-markdown-preview").textContent = markdown;
-    $("todo-modal").classList.remove("hidden");
-  }
 
   $("btn-view-todo").addEventListener("click", async () => {
     if (!state.currentPlan) return;
@@ -379,261 +789,15 @@
     }
   });
 
-  // Modal controls
-  document.querySelectorAll("[data-close-modal]").forEach((el) => {
-    el.addEventListener("click", () => $("todo-modal").classList.add("hidden"));
-  });
-  $("btn-copy-todo").addEventListener("click", async () => {
-    await navigator.clipboard.writeText(state.currentTodoMarkdown);
-    showToast("Copied CD To-Do Markdown to clipboard");
-  });
-  $("btn-download-todo-md").addEventListener("click", () => {
-    if (state.currentTodoDownloadUrl) window.location.href = state.currentTodoDownloadUrl;
-  });
-
-  // ======================== GALLERY VIEW ========================
-  async function loadAnimesList(openSelected = true) {
-    const data = await apiJson("/api/animes");
-    state.animes = data.animes || [];
-    $("anime-count-badge").textContent = String(state.animes.length);
-    renderAnimeSidebar();
-    if (openSelected && state.currentAnimeSlug) {
-      await selectAnime(state.currentAnimeSlug);
-    }
-  }
-
-  function renderAnimeSidebar() {
-    const q = ($("anime-search").value || "").toLowerCase().trim();
-    const filtered = state.animes.filter(
-      (a) =>
-        !q ||
-        a.name.toLowerCase().includes(q) ||
-        (a.jp_name || "").toLowerCase().includes(q) ||
-        (a.aliases || []).some((al) => al.toLowerCase().includes(q))
-    );
-    $("anime-list").innerHTML = filtered
-      .map((a) => {
-        const active = a.slug === state.currentAnimeSlug ? "active" : "";
-        const pills = a.scanned
-          ? `<span class="badge badge-ok">${a.ready_saavn}</span><span class="badge badge-warn">${a.todo_cd}</span>`
-          : `<span class="badge badge-neutral">Scan</span>`;
-        return `
-          <button class="anime-item ${active}" type="button" data-slug="${escapeHtml(a.slug)}">
-            <div>
-              <span class="anime-item-name">${escapeHtml(a.name)}</span>
-              <span class="anime-item-jp">${escapeHtml(a.jp_name)}</span>
-            </div>
-            <div class="anime-item-pills">${pills}</div>
-          </button>
-        `;
-      })
-      .join("");
-
-    $("anime-list").querySelectorAll(".anime-item").forEach((btn) => {
-      btn.addEventListener("click", () => selectAnime(btn.dataset.slug));
-    });
-  }
-
-  $("anime-search").addEventListener("input", renderAnimeSidebar);
-
-  async function selectAnime(slug) {
-    state.currentAnimeSlug = slug;
-    renderAnimeSidebar();
-    const gallery = await apiJson(`/api/animes/${slug}`);
-    state.currentGallery = gallery;
-    renderGalleryStage();
-  }
-
-  function renderGalleryStage() {
-    const gal = state.currentGallery;
-    if (!gal) return;
-    const f = gal.franchise;
-    $("gal-title").textContent = f.name;
-    $("gal-jp").textContent = f.jp_name;
-    $("gal-notes").textContent = `${f.notes} · Japanese originals only (soundtracks/OSTs automatically excluded)`;
-
-    const plBar = $("gal-playlists-bar");
-    const playlists = gal.linked_playlists || [];
-    if (playlists.length > 0) {
-      plBar.classList.remove("hidden");
-      plBar.innerHTML =
-        `<span class="preset-label">Linked Spotify Playlists:</span>` +
-        playlists
-          .map(
-            (p) =>
-              `<button class="chip open-pl-btn" type="button" data-url="${escapeHtml(p.url)}">${escapeHtml(p.label)} → Analyze</button>`
-          )
-          .join("");
-      plBar.querySelectorAll(".open-pl-btn").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          $("tab-playlist").click();
-          $("spotify-url").value = btn.dataset.url;
-          runAnalyze();
-        });
-      });
-    } else {
-      plBar.classList.add("hidden");
-    }
-
-    const entries = gal.entries || [];
-    const filtered = entries.filter((e) => {
-      if (state.galleryFilter === "all") return true;
-      if (["OP", "ED", "Movie"].includes(state.galleryFilter)) return e.category === state.galleryFilter;
-      if (state.galleryFilter === "Character") return ["Character", "Insert", "Special"].includes(e.category);
-      return e.status === state.galleryFilter;
-    });
-
-    $("gal-count-note").textContent = `${filtered.length} of ${entries.length} entries`;
-
-    const grid = $("gallery-grid");
-    if (entries.length === 0) {
-      grid.innerHTML = `
-        <div class="empty-state">
-          <p><strong>${escapeHtml(f.name)}</strong> hasn't been scanned yet.</p>
-          <p class="muted">Click <strong>"Scan Wikis, Singles &amp; 3000px Covers"</strong> above to fetch all Japanese openings, endings, movie singles &amp; character songs (excluding soundtracks), resolve official covers &amp; metadata, verify JioSaavn, and build CD To-Do cards.</p>
-        </div>
-      `;
-      return;
-    }
-
-    if (filtered.length === 0) {
-      grid.innerHTML = `<div class="empty-state">No entries match the current filter.</div>`;
-      return;
-    }
-
-    grid.innerHTML = filtered
-      .map((e) => {
-        const statusMap = {
-          ready_saavn: ["badge-ok", "Ready on JioSaavn"],
-          todo_cd: ["badge-warn", "CD To-Do"],
-          flagged_cover: ["badge-flag", "Cover Flagged · CD To-Do"],
-          owned_cd: ["badge-ok", "Ripped from CD ✓"],
-        };
-        const [stCls, stLbl] = statusMap[e.status] || ["badge-neutral", e.status];
-
-        const artHtml = e.cover_url
-          ? `<img class="card-art-img" src="${escapeHtml(e.cover_url)}" alt="${escapeHtml(e.title)}" loading="lazy" />
-             ${e.cover_resolution ? `<span class="card-res-badge">${escapeHtml(e.cover_resolution)} ${escapeHtml(e.cover_source || "")}</span>` : ""}`
-          : `<div class="card-art-sleeve">
-               <span class="sleeve-cat">${escapeHtml(f.name)} · ${escapeHtml(e.label)}</span>
-               <div class="sleeve-title">${escapeHtml(e.title)}</div>
-               <div class="sleeve-artist">${escapeHtml(e.artist)}</div>
-             </div>`;
-
-        const singleTracks = e.single_tracks || [];
-        const tracksDrawer = singleTracks.length
-          ? `<details class="card-single-tracks">
-               <summary>Single tracklist (${singleTracks.length} tracks)</summary>
-               <ol>${singleTracks.map((st) => `<li>${escapeHtml(st.title)}</li>`).join("")}</ol>
-             </details>`
-          : "";
-
-        return `
-          <article class="album-card">
-            <div class="card-art-box">
-              ${artHtml}
-              <div class="card-top-badges">
-                <span class="badge badge-neutral" style="background:rgba(255,255,255,0.92)">${escapeHtml(e.label)}</span>
-                <span class="badge ${stCls}">${stLbl}</span>
-              </div>
-            </div>
-            <div class="card-body">
-              <div class="card-title">${escapeHtml(e.title)}</div>
-              <div class="card-artist">${escapeHtml(e.artist)}</div>
-              <div class="card-meta">
-                ${e.single_or_album ? `Single: ${escapeHtml(e.single_or_album)}` : "Single metadata pending"}
-                ${e.single_track_count ? ` (${e.single_track_count}t)` : ""}
-                ${e.release_date ? ` · ${escapeHtml(e.release_date)}` : ""}
-              </div>
-              ${e.episodes_or_context ? `<div class="card-meta">${escapeHtml(e.episodes_or_context)}</div>` : ""}
-              ${tracksDrawer}
-              <div class="card-footer">
-                <button class="btn btn-secondary btn-sm toggle-cd-btn" type="button" data-entry="${escapeHtml(e.entry_id)}" data-owned="${e.owned_from_cd ? "1" : "0"}">
-                  ${e.owned_from_cd ? "✓ In Library (Undo)" : "Mark Ripped from CD"}
-                </button>
-                <div class="card-links">
-                  ${e.spotify_track_url ? `<a class="link-pill" href="${escapeHtml(e.spotify_track_url)}" target="_blank" rel="noopener">Spotify</a>` : ""}
-                  ${e.youtube_music_query_url ? `<a class="link-pill" href="${escapeHtml(e.youtube_music_query_url)}" target="_blank" rel="noopener">YT Music</a>` : ""}
-                </div>
-              </div>
-            </div>
-          </article>
-        `;
-      })
-      .join("");
-
-    grid.querySelectorAll(".toggle-cd-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const nextOwned = btn.dataset.owned !== "1";
-        await apiJson(`/api/animes/${state.currentAnimeSlug}/toggle-cd`, {
-          method: "POST",
-          body: JSON.stringify({ entry_id: btn.dataset.entry, owned: nextOwned }),
-        });
-        await selectAnime(state.currentAnimeSlug);
-        loadAnimesList(false);
-      });
-    });
-  }
-
-  $("gallery-filters").querySelectorAll(".pill").forEach((p) => {
-    p.addEventListener("click", () => {
-      $("gallery-filters").querySelectorAll(".pill").forEach((x) => x.classList.remove("active"));
-      p.classList.add("active");
-      state.galleryFilter = p.dataset.gfilter;
-      renderGalleryStage();
-    });
-  });
-
-  $("btn-scan-anime").addEventListener("click", async () => {
-    const slug = state.currentAnimeSlug;
-    if (!slug) return;
-    $("btn-scan-anime").disabled = true;
-    $("gallery-progress").classList.remove("hidden");
-    try {
-      const { job_id } = await apiJson(`/api/animes/${slug}/scan`, {
-        method: "POST",
-        body: JSON.stringify({
-          check_saavn: true,
-          enrich_itunes: true,
-          proxy_url: $("proxy-url").value.trim(),
-        }),
-      });
-      const gal = await pollJob(job_id, (msg, pct) => {
-        $("gallery-progress-msg").textContent = msg;
-        $("gallery-progress-pct").textContent = `${pct}%`;
-        $("gallery-progress-fill").style.width = `${pct}%`;
-      });
-      state.currentGallery = gal;
-      renderGalleryStage();
-      loadAnimesList(false);
-      showToast(`Scanned ${gal.franchise.name}: ${gal.entries.length} singles/themes built`);
-    } catch (err) {
-      showToast(`Scan error: ${err.message}`);
-    } finally {
-      $("btn-scan-anime").disabled = false;
-      setTimeout(() => $("gallery-progress").classList.add("hidden"), 900);
-    }
-  });
-
-  $("btn-anime-todo").addEventListener("click", async () => {
-    if (!state.currentAnimeSlug) return;
-    const url = `/api/animes/${state.currentAnimeSlug}/todo.md`;
-    const md = await (await fetch(url)).text();
-    openTodoModal(md, url);
-  });
-
-  $("btn-master-todo").addEventListener("click", async () => {
-    const url = `/api/animes/all/todo.md`;
-    const md = await (await fetch(url)).text();
-    openTodoModal(md, url);
-  });
-
-  // Init
+  // Init: load config and immediately populate the 83-Anime Autopilot Gallery
   (async () => {
     try {
       const cfg = await apiJson("/api/config");
       $("out-folder").value = cfg.out_folder || "";
+      $("gal-out-folder").value = cfg.out_folder || "";
       $("proxy-url").value = cfg.proxy_url || "";
+      $("gal-proxy-url").value = cfg.proxy_url || "";
     } catch (_) {}
+    await loadAnimesList(true);
   })();
 })();
