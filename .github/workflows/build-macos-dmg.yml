@@ -15,16 +15,8 @@ permissions:
 
 jobs:
   build-macos:
-    name: Build macOS DMG (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            arch: arm64-AppleSilicon
-          - runner: macos-15-intel
-            arch: x86_64-Intel
+    name: Build macOS DMG (Apple Silicon arm64)
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
@@ -75,7 +67,7 @@ jobs:
           mkdir -p dist/dmg_staging
           cp -R "dist/Saavn-Downloader Studio.app" dist/dmg_staging/
           ln -s /Applications dist/dmg_staging/Applications
-          DMG_NAME="Saavn-Downloader-Studio-macOS-${{ matrix.arch }}.dmg"
+          DMG_NAME="Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg"
           hdiutil create \
             -volname "Saavn-Downloader Studio" \
             -srcfolder dist/dmg_staging \
@@ -87,53 +79,32 @@ jobs:
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Saavn-Downloader-Studio-macOS-${{ matrix.arch }}
-          path: dist/Saavn-Downloader-Studio-macOS-${{ matrix.arch }}.dmg
+          name: Saavn-Downloader-Studio-macOS-arm64-AppleSilicon
+          path: dist/Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg
 
-  publish-release:
-    name: Publish GitHub Release with DMG downloads
-    needs: build-macos
-    runs-on: ubuntu-latest
-    if: always() && (needs.build-macos.result == 'success' || needs.build-macos.result == 'failure')
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download built DMG artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release_assets
-          merge-multiple: true
-
-      - name: Verify at least one DMG was built
-        run: |
-          ls -lh release_assets/
-          test -n "$(find release_assets -maxdepth 1 -name '*.dmg' -print -quit)"
-
-      - name: Create or update GitHub Release with DMGs
+      - name: Publish GitHub Release with DMG
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="studio-latest"
-          TITLE="Saavn-Downloader Studio (macOS DMG)"
+          TITLE="Saavn-Downloader Studio (macOS Apple Silicon DMG)"
           cat <<'EOF' > release_notes.md
-          ## Saavn-Downloader Studio for macOS
+          ## Saavn-Downloader Studio for macOS (Apple Silicon — M1 / M2 / M3 / M4)
 
-          - **Apple Silicon (M1 / M2 / M3 / M4):** Download `Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg`
-          - **Intel Mac:** Download `Saavn-Downloader-Studio-macOS-x86_64-Intel.dmg`
+          Download **`Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg`** below.
 
           ### Installation on macOS
           1. Open the `.dmg` and drag **Saavn-Downloader Studio.app** into **Applications**.
-          2. Because this build is ad-hoc signed (not notarized with a paid Apple Developer ID), the first time you launch it: **right-click → Open**, or run:
+          2. Because this build is ad-hoc signed (not notarized with a paid Apple Developer ID), the first time you launch it: **right-click → Open**, or run in Terminal:
              ```sh
              xattr -cr "/Applications/Saavn-Downloader Studio.app"
              ```
           3. Downloads are saved by default to `~/Music/Saavn-Downloader`, and your 83-Anime Collection Gallery & CD To-Do progress is stored in `~/Library/Application Support/Saavn-Downloader/`.
           EOF
-          sed -i 's/^          //' release_notes.md
+          sed -i '' 's/^          //' release_notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release_assets/*.dmg --clobber
+            gh release upload "$TAG" dist/Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg --clobber
             gh release edit "$TAG" --title "$TITLE" --notes-file release_notes.md --target "${{ github.sha }}"
           else
-            gh release create "$TAG" release_assets/*.dmg --title "$TITLE" --notes-file release_notes.md --target "${{ github.sha }}"
+            gh release create "$TAG" dist/Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg --title "$TITLE" --notes-file release_notes.md --target "${{ github.sha }}"
           fi
