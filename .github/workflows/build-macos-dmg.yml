@@ -16,39 +16,47 @@ permissions:
 jobs:
   build-macos:
     name: Build macOS DMG (Apple Silicon arm64)
-    runs-on: macos-latest
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install runtime and macOS packaging dependencies
+      - name: Install official python.org Universal2 Python 3.12 (contains native arm64 slice)
         run: |
+          curl -fSL https://www.python.org/ftp/python/3.12.8/python-3.12.8-macos11.pkg -o /tmp/python-universal2.pkg
+          sudo installer -pkg /tmp/python-universal2.pkg -target /
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 --version
+          lipo -info /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m venv .venv-u2
+
+      - name: Install runtime and universal2 macOS packaging dependencies
+        run: |
+          source .venv-u2/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller pywebview pyobjc-framework-Cocoa pyobjc-framework-WebKit pytest
 
       - name: Run unit tests
         run: |
+          source .venv-u2/bin/activate
           python -m pytest Tests/test_spotify_and_verification.py Tests/test_helper.py -v
 
       - name: Generate native macOS .icns icon
         run: |
+          source .venv-u2/bin/activate
           python packaging/make_icon.py packaging/SaavnDownloader.iconset
           iconutil -c icns packaging/SaavnDownloader.iconset -o packaging/SaavnDownloader.icns
 
-      - name: Build Saavn-Downloader Studio.app with PyInstaller
+      - name: Build native Apple Silicon (arm64) Saavn-Downloader Studio.app
         run: |
+          source .venv-u2/bin/activate
           pyinstaller \
             --noconfirm \
             --clean \
             --windowed \
             --onedir \
+            --target-arch arm64 \
             --name "Saavn-Downloader Studio" \
             --icon "packaging/SaavnDownloader.icns" \
             --osx-bundle-identifier "com.juanmirodas.saavndownloader.studio" \
@@ -56,6 +64,8 @@ jobs:
             --hidden-import "webview.platforms.cocoa" \
             --hidden-import "mutagen.mp4" \
             desktop_app.py
+          lipo -info "dist/Saavn-Downloader Studio.app/Contents/MacOS/Saavn-Downloader Studio"
+          file "dist/Saavn-Downloader Studio.app/Contents/MacOS/Saavn-Downloader Studio"
 
       - name: Ad-hoc sign .app bundle
         run: |
