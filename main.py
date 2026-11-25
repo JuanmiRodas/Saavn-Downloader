@@ -3,7 +3,10 @@ from scripts.content.playlist import Playlist
 from scripts.content.album import Album
 from scripts.content.artist import Artist
 from scripts.content.song import Song
+from scripts.content.spotify_playlist import SpotifyPlaylistDownloader
 from scripts.saavnaccount import Account
+from scripts.anime_catalog import AnimeCatalogManager, ANIME_FRANCHISES
+from scripts.web_ui import start_web_server
 
 class Download():
     def __init__(self):
@@ -22,6 +25,44 @@ class Download():
         args = argManager()
         album_name="songs"
         proxies, headers = setProxy()
+        if getattr(args, "proxy", None):
+            proxies = {"http": args.proxy, "https": args.proxy}
+
+        # Launch local Web UI & 83-Anime Collection Gallery
+        if getattr(args, "web", False):
+            start_web_server(
+                port=args.port,
+                out_folder=args.outFolder,
+                proxy_url=args.proxy,
+            )
+            return
+
+        if getattr(args, "list_animes", False):
+            print(f"\nSupported Anime Series ({len(ANIME_FRANCHISES)}):")
+            for idx, f in enumerate(ANIME_FRANCHISES, start=1):
+                print(f"  {idx:2d}. {f.slug:26s} | {f.name} ({f.jp_name})")
+            return
+
+        if getattr(args, "scan_anime", None):
+            slug = args.scan_anime.strip()
+            catalog = AnimeCatalogManager(proxies=proxies, headers=headers)
+            print(f"Scanning anime '{slug}' from wikis, singles & JioSaavn...")
+            gallery = catalog.scan_anime(
+                slug,
+                check_saavn=True,
+                enrich_itunes=True,
+                progress_callback=lambda done, total: print(f"  [{done}/{total}] resolving singles & covers..."),
+            )
+            entries = gallery.get("entries") or []
+            print(f"Built {len(entries)} gallery entries for {gallery['franchise']['name']}.")
+            md = catalog.build_master_todo_markdown(slug)
+            out_dir = args.outFolder or "."
+            import os
+            todo_file = os.path.join(out_dir, f"{slug}_CD_TODO.md")
+            with open(todo_file, "w", encoding="utf-8") as fh:
+                fh.write(md)
+            print(f"Saved CD To-Do list to: {todo_file}")
+            return
 
         # Manage for jio saavn users
         if args.user:
@@ -55,7 +96,22 @@ class Download():
 
             for dl_url in dl_urls:
                 dl_type = scan_url(url=dl_url)
-                if dl_type == "playlist":      
+                if dl_type in ("spotify_playlist", "spotify_album", "spotify_track"):
+                    sp_dl = SpotifyPlaylistDownloader(
+                        proxies=proxies,
+                        headers=headers,
+                        out_folder=args.outFolder,
+                        strict_versions=args.strict_versions,
+                    )
+                    sp_dl.run_cli(
+                        dl_url,
+                        include_albums=args.include_albums,
+                        max_album_tracks=args.max_album_tracks,
+                        reference_mode=args.reference,
+                        interactive=not args.no_interactive,
+                        dry_run=args.dry_run,
+                    )
+                elif dl_type == "playlist":      
                     playlist = Playlist(proxies, headers, dl_url)
                     playlist.start_download()
                 elif dl_type == "album":

@@ -1,0 +1,416 @@
+import io
+import json
+import os
+import struct
+import tempfile
+import threading
+import urllib.request
+from types import SimpleNamespace
+
+import pytest
+
+from scripts import helper
+from scripts.activity_log import ActivityLogger, activity_log
+from scripts.anime_catalog import (
+    ANIME_FRANCHISES,
+    FRANCHISE_BY_SLUG,
+    AnimeCatalogManager,
+    _extract_ja_wiki_themes,
+    detect_anime_franchise,
+    is_soundtrack_album,
+)
+from scripts.artwork_and_tags import detect_image_dimensions
+from scripts.content.spotify_playlist import compute_album_expansion
+from scripts.reference_checker import ReferenceChecker, detect_cover_or_karaoke
+from scripts.saavn_matcher import SaavnMatch, SaavnMatcher
+from scripts.spotify_client import parse_spotify_url
+from scripts.todo_exporter import build_todo_markdown, export_todo_and_plan
+from scripts.web_ui import AppState, make_handler
+from http.server import ThreadingHTTPServer
+
+
+class TestSpotifyUrlAndHelper:
+    @pytest.mark.parametrize(
+        "url, expected_parse, expected_scan",
+        [
+            (
+                "https://open.spotify.com/playlist/4IQUdsVry6H16OT9e19Ldz",
+                ("playlist", "4IQUdsVry6H16OT9e19Ldz"),
+                "spotify_playlist",
+            ),
+            (
+                "https://open.spotify.com/playlist/4v6JxXh5OonEhXn2suacOO?si=abc123",
+                ("playlist", "4v6JxXh5OonEhXn2suacOO"),
+                "spotify_playlist",
+            ),
+            (
+                "https://open.spotify.com/intl-es/album/3EJNxm64X3fPDaBX4U4ui4",
+                ("album", "3EJNxm64X3fPDaBX4U4ui4"),
+                "spotify_album",
+            ),
+            (
+                "https://open.spotify.com/intl-es/album/74FWMBzqWcuqRh18aGyphf",
+                ("album", "74FWMBzqWcuqRh18aGyphf"),
+                "spotify_album",
+            ),
+            (
+                "spotify:track:37wZDW2UoJHpzG5xJyBpgn",
+                ("track", "37wZDW2UoJHpzG5xJyBpgn"),
+                "spotify_track",
+            ),
+        ],
+    )
+    def test_spotify_url_parsing(self, url, expected_parse, expected_scan):
+        assert parse_spotify_url(url) == expected_parse
+        assert helper.scan_url(url) == expected_scan
+
+
+class TestReferenceVerification:
+    def _track(self, pos, title, artists, album_name=""):
+        return SimpleNamespace(
+            position=pos,
+            title=title,
+            artists=artists,
+            album_name=album_name,
+        )
+
+    def test_one_piece_openings_crosscheck_flags_covers_and_accepts_originals(self):
+        checker = ReferenceChecker(use_network=False)
+        tracks = [
+            self._track(1, "ウィーアー!", ["Hiroshi Kitadani"], "ウィーアー!"),
+            self._track(2, "Believe", ["Folder 5"], "HYPER GROOVE 1"),
+            self._track(8, "Crazy Rainbow (第284-325話 OP)", ["Super DJ Yuuki"], "熱烈！アニソン魂 THE BEST カバー楽曲集"),
+            self._track(9, "Jungle P", ["Hiroshi Kitadani"], "ONE PIECE SONG COVERS"),
+            self._track(10, "ウィーアー! (第1-47話 OP)", ["Hisao Noguchi"], "熱烈！アニソン魂 THE BEST カバー楽曲集"),
+            self._track(15, "ウィーゴー！", ["Hiroshi Kitadani"], "ウィーゴー！"),
+            self._track(16, "HANDS UP !", ["新里宏太"], "HANDS UP!"),
+            self._track(29, "ルミナス - Luminous", ["AiNA THE END"], "ルミナス - Luminous"),
+        ]
+        mode, results, missing = checker.crosscheck_playlist("One Piece Openings (1-29)", tracks)
+        assert mode == "one-piece-openings"
+
+        by_pos = {t.position: r for t, r in zip(tracks, results)}
+        assert by_pos[1].status == "verified" and by_pos[1].enabled_by_default is True
+        assert by_pos[2].status == "verified" and by_pos[2].enabled_by_default is True
+        assert by_pos[15].status == "verified" and by_pos[15].enabled_by_default is True
+        assert by_pos[16].status == "verified" and by_pos[16].enabled_by_default is True
+        assert by_pos[29].status == "verified" and by_pos[29].enabled_by_default is True
+
+        # Flagged covers must be disabled by default
+        for bad_pos in (8, 9, 10):
+            assert by_pos[bad_pos].status == "flagged"
+            assert by_pos[bad_pos].enabled_by_default is False
+            assert len(by_pos[bad_pos].flags) >= 1
+
+        assert by_pos[8].matched_reference.number == 8
+        assert by_pos[8].matched_reference.artist == "Tackey & Tsubasa"
+        assert by_pos[10].matched_reference.number == 10
+        assert by_pos[10].matched_reference.artist == "TVXQ"
+
+        # Unincluded openings appear in missing list
+        missing_nums = {m.number for m in missing}
+        assert 3 in missing_nums
+        assert 1 not in missing_nums
+
+    def test_one_piece_endings_detects_missing_ed3_and_karaoke(self):
+        checker = ReferenceChecker(use_network=False)
+        tracks = [
+            self._track(1, "memories", ["Maki Otsuki"]),
+            self._track(2, "RUN! RUN! RUN!", ["Maki Otsuki"]),
+            # ED #3 Watashi ga Iru Yo (TOMATO CUBE) intentionally missing!
+            self._track(3, "しょうちのすけ", ["Suiteisho-jo"]),
+            self._track(4, "BEFORE DAWN", ["AI-SACHI"]),
+            self._track(5, "fish(カラオケ)[原曲歌手:The Kaleidoscope]", ["歌っちゃ王"]),
+            self._track(6, "GLORY-君がいるから-", ["上原多香子"]),
+            self._track(12, "DREAMSHIP (アニメ「ONE PIECE」13thエンディングテーマ)(セルフカバー)", ["ACKO"]),
+            self._track(22, "Sono Mirai (One Piece)", ["Rumia Orchestra"]),
+        ]
+        mode, results, missing = checker.crosscheck_playlist("One Piece Endings 1-22", tracks)
+        assert mode == "one-piece-endings"
+
+        by_pos = {t.position: r for t, r in zip(tracks, results)}
+        assert by_pos[1].status == "verified"
+        assert by_pos[3].status == "verified"
+        assert by_pos[3].matched_reference.number == 4
+        assert by_pos[6].status == "verified"
+        assert by_pos[6].matched_reference.number == 7
+
+        assert by_pos[5].status == "flagged" and by_pos[5].enabled_by_default is False
+        assert by_pos[12].status == "flagged" and by_pos[12].enabled_by_default is False
+        assert by_pos[22].status == "flagged" and by_pos[22].enabled_by_default is False
+
+        missing_nums = {m.number for m in missing}
+        assert 3 in missing_nums
+
+    def test_general_cover_detector(self):
+        assert detect_cover_or_karaoke("raise (one piece lofi)", ["Toastaku"])
+        assert detect_cover_or_karaoke("Luminous (Piano Cover)", ["Capybara Piano"])
+        assert detect_cover_or_karaoke("Believe", ["Folder 5"], album_name="HYPER GROOVE 1") == []
+
+
+class TestAlbumExpansionAndSoundtrackFilter:
+    def test_expansion_threshold_examples(self):
+        # Single ウィーゴー！ has 4 tracks -> expands with max=6
+        we_go = {"album_name": "ウィーゴー！", "album_total_tracks": 4}
+        expand, _ = compute_album_expansion(we_go, include_albums=True, max_album_tracks=6)
+        assert expand is True
+
+        # Album HYPER GROOVE 1 has 13 tracks -> song only with max=6
+        hyper_groove = {"album_name": "HYPER GROOVE 1", "album_total_tracks": 13}
+        expand2, _ = compute_album_expansion(hyper_groove, include_albums=True, max_album_tracks=6)
+        assert expand2 is False
+
+        # Songs-only mode never expands
+        expand3, _ = compute_album_expansion(we_go, include_albums=False, max_album_tracks=6)
+        assert expand3 is False
+
+        # Soundtracks are always excluded from expansion
+        ost = {"album_name": "One Piece Original Soundtrack Vol. 1", "album_total_tracks": 4}
+        expand4, _ = compute_album_expansion(ost, include_albums=True, max_album_tracks=6)
+        assert expand4 is False
+
+    def test_soundtrack_and_dub_exclusion(self):
+        assert is_soundtrack_album("One Piece Original Soundtrack") is True
+        assert is_soundtrack_album("BLEACH オリジナル・サウンドトラック") is True
+        assert is_soundtrack_album("We Are! (4Kids English Dub)") is True
+        assert is_soundtrack_album("ウィーゴー！") is False
+
+
+class TestSaavnStrictMatcher:
+    def test_matcher_rejects_lofi_cover_and_accepts_original(self, monkeypatch):
+        matcher = SaavnMatcher()
+
+        fake_results = [
+            SaavnMatch(
+                song_id="bad1",
+                title="raise (one piece lofi)",
+                artists=["Toastaku"],
+                album="raise (one piece lofi)",
+                album_id="a1",
+                year="2024",
+                duration_sec=180,
+                encrypted_media_url="ENC1",
+                is_320kbps=True,
+                image_url="https://example.com/1-500x500.jpg",
+                language="instrumental",
+            ),
+            SaavnMatch(
+                song_id="good1",
+                title="Raise",
+                artists=["Chilli Beans."],
+                album="Raise",
+                album_id="a2",
+                year="2023",
+                duration_sec=184,
+                encrypted_media_url="ENC2",
+                is_320kbps=True,
+                image_url="https://example.com/2-500x500.jpg",
+                language="japanese",
+            ),
+        ]
+        monkeypatch.setattr(matcher, "search_songs", lambda q, limit=6: fake_results)
+        monkeypatch.setattr(matcher, "check_artist_verified", lambda aid: True)
+
+        match, note = matcher.match_track("Raise", ["Chilli Beans."], duration_ms=185000)
+        assert match is not None
+        assert match.song_id == "good1"
+
+        # If ONLY cover is returned, matcher must return None!
+        monkeypatch.setattr(matcher, "search_songs", lambda q, limit=6: [fake_results[0]])
+        match2, note2 = matcher.match_track("Raise", ["Chilli Beans."], duration_ms=185000)
+        assert match2 is None
+        assert "cover" in note2.lower() or "unverified" in note2.lower()
+
+    def test_matcher_rejects_remix_live_tvsize_and_duration_mismatch(self, monkeypatch):
+        matcher = SaavnMatcher()
+        bad_candidates = [
+            SaavnMatch("r1", "Raise (Live)", ["Chilli Beans."], "Live Tour", "a1", "2024", 184, "E", True, "", language="japanese"),
+            SaavnMatch("r2", "Raise - Slowed + Reverb", ["Chilli Beans."], "Raise", "a2", "2024", 184, "E", True, "", language="japanese"),
+            SaavnMatch("r3", "Raise (TV Size)", ["Chilli Beans."], "Raise", "a3", "2024", 90, "E", True, "", language="japanese"),
+            SaavnMatch("r4", "Raise", ["Chilli Beans."], "Raise", "a4", "2024", 92, "E", True, "", language="japanese"),  # 92s vs 185s official -> rejected
+        ]
+        monkeypatch.setattr(matcher, "search_songs", lambda q, limit=6: bad_candidates)
+        monkeypatch.setattr(matcher, "check_artist_verified", lambda aid: True)
+        match, note = matcher.match_track("Raise", ["Chilli Beans."], duration_ms=185000)
+        assert match is None
+        assert "unverified" in note.lower() or "rejected" in note.lower()
+
+
+class TestArtworkAndTodoAndCatalog:
+    def test_png_dimension_detection(self):
+        # Minimal valid PNG header with 1400x1400 IHDR
+        png = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 1400, 1400) + b"\x00" * 10
+        w, h, mime = detect_image_dimensions(png)
+        assert (w, h, mime) == (1400, 1400, "image/png")
+
+    def test_all_83_animes_registered_and_unique(self):
+        assert len(ANIME_FRANCHISES) == 83
+        slugs = [f.slug for f in ANIME_FRANCHISES]
+        assert len(slugs) == len(set(slugs))
+        assert detect_anime_franchise("One Piece Openings (1-29)").slug == "one-piece"
+        assert detect_anime_franchise("Fullmetal Alchemist: Brotherhood OP").slug == "fullmetal-alchemist"
+        assert detect_anime_franchise("ef a tale of melodies").slug == "ef-a-tale-of-melodies"
+
+    def test_autopilot_creates_anime_folder_and_master_index(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "db.json")
+            out_dir = os.path.join(tmp, "music")
+            catalog = AnimeCatalogManager(db_path=db_path)
+            # Pre-seed a scanned anime with 1 unavailable CD To-Do entry (no network needed)
+            catalog._db["animes"]["death-note"] = {
+                "last_scanned": "2026-11-25T00:00:00Z",
+                "folder_path": "",
+                "linked_playlists": [],
+                "entries": [
+                    {
+                        "entry_id": "death-note:op:1",
+                        "anime_slug": "death-note",
+                        "category": "OP",
+                        "number": 1,
+                        "label": "OP #1",
+                        "title": "the WORLD",
+                        "artist": "ナイトメア",
+                        "romanized_title": "the WORLD",
+                        "romanized_artist": "NIGHTMARE",
+                        "single_or_album": "the WORLD / アルミナ",
+                        "single_track_count": 2,
+                        "single_tracks": [],
+                        "release_date": "2006-10-18",
+                        "saavn_match": None,
+                        "saavn_note": "No verified original recording found on JioSaavn",
+                        "downloaded_files": [],
+                        "status": "todo_cd",
+                        "flags": [],
+                        "owned_from_cd": False,
+                    }
+                ],
+            }
+            catalog._save_db()
+            res = catalog.run_autopilot(
+                ["death-note"],
+                out_folder=out_dir,
+                skip_already_scanned=True,
+            )
+            assert res["processed_animes"] == 1
+            assert res["total_todo"] == 1
+            assert os.path.isdir(os.path.join(out_dir, "Death Note"))
+            assert os.path.isfile(os.path.join(out_dir, "Death Note", "CD_TODO_LIST.md"))
+            assert os.path.isfile(os.path.join(out_dir, "Death Note", "catalog.json"))
+            assert os.path.isfile(os.path.join(out_dir, "ALL_ANIMES_CD_TODO.md"))
+            assert os.path.isfile(os.path.join(out_dir, "DIRECTORY_INDEX.md"))
+
+    def test_todo_export_writes_markdown_and_json(self):
+        plan = {
+            "playlist": {"name": "One Piece Endings 1-22", "url": "https://open.spotify.com/playlist/4v6JxXh5OonEhXn2suacOO"},
+            "reference_mode": "one-piece-endings",
+            "summary": {"total_tracks": 1, "ready_to_download": 0},
+            "items": [
+                {
+                    "position": 5,
+                    "track": {"position": 5, "title": "fish(カラオケ)", "artists": ["歌っちゃ王"]},
+                    "verification": {
+                        "status": "flagged",
+                        "flags": ["Karaoke track"],
+                        "warnings": [],
+                        "matched_reference": {"label": "One Piece ED #6", "title": "fish", "artist": "The Kaleidoscope", "episodes": "95-106"},
+                    },
+                    "saavn_match": None,
+                }
+            ],
+            "missing_references": [
+                {"label": "One Piece ED #3", "title": "Watashi ga Iru Yo", "artist": "TOMATO CUBE", "episodes": "64-73"}
+            ],
+        }
+        md = build_todo_markdown(plan)
+        assert "One Piece ED #6 — fish" in md
+        assert "One Piece ED #3 — Watashi ga Iru Yo" in md
+        with tempfile.TemporaryDirectory() as tmp:
+            todo_path, plan_path = export_todo_and_plan(tmp, plan)
+            assert os.path.isfile(todo_path)
+            assert os.path.isfile(plan_path)
+
+    def test_web_ui_server_endpoints(self):
+        state = AppState(out_folder=tempfile.gettempdir())
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+        port = server.server_address[1]
+        th = threading.Thread(target=server.serve_forever, daemon=True)
+        th.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as r:
+                assert r.status == 200
+                body = r.read()
+                assert b"Saavn-Downloader Studio" in body
+                assert b"Run All 83 Animes" in body
+                assert b"Live Activity Log" in body
+                assert b"music.youtube.com" not in body
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/animes") as r:
+                data = json.loads(r.read().decode("utf-8"))
+                assert len(data["animes"]) == 83
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/animes/one-piece") as r:
+                gal = json.loads(r.read().decode("utf-8"))
+                assert gal["franchise"]["slug"] == "one-piece"
+            activity_log.log("TEST", "Smoke log event for /api/logs")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/logs?since=0") as r:
+                log_data = json.loads(r.read().decode("utf-8"))
+                assert log_data["seq"] >= 1
+                assert any(e["tag"] == "TEST" and "Smoke log event" in e["message"] for e in log_data["entries"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_activity_logger_persists_and_filters_since(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = os.path.join(tmp, "studio.log")
+            logger = ActivityLogger(max_entries=10, log_path=log_file)
+            e1 = logger.log("WIKI", "Loaded Air Gear")
+            e2 = logger.log("SAAVN", "0 official matches", level="WARN")
+            assert e2["seq"] > e1["seq"]
+            seq, since_e1 = logger.get_since(since_seq=e1["seq"])
+            assert seq == e2["seq"]
+            assert len(since_e1) == 1
+            assert since_e1[0]["tag"] == "SAAVN"
+            assert os.path.isfile(log_file)
+            with open(log_file, "r", encoding="utf-8") as fh:
+                txt = fh.read()
+            assert "[WIKI] Loaded Air Gear" in txt
+            assert "[WARN] [SAAVN] 0 official matches" in txt
+            logger.clear()
+            _, after_clear = logger.get_since(0)
+            assert after_clear == []
+
+    def test_ja_wiki_inline_heading_extraction_air_gear(self):
+        wikitext = """=== 主題歌 ===
+; オープニングテーマ「[[Chain (BACK-ONの曲)|Chain]]」
+: 作詞 - TEEDA, KENJI03 / 作曲・編曲・唄 - [[BACK-ON]]
+; エンディングテーマ「SKY-2-HIGH」
+: 制作 - [[skankfunk]]
+"""
+        songs = _extract_ja_wiki_themes(wikitext, FRANCHISE_BY_SLUG["air-gear"])
+        assert len(songs) == 2
+        assert songs[0]["category"] == "OP"
+        assert songs[0]["title"] == "Chain"
+        assert "BACK-ON" in songs[0]["artist"]
+        assert songs[1]["category"] == "ED"
+        assert songs[1]["title"] == "SKY-2-HIGH"
+        assert "skankfunk" in songs[1]["artist"]
+
+    def test_download_anime_entries_handles_zero_entries_without_crash(self):
+        """Regression test: 0-entry series must never crash run_autopilot on the 2nd anime."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "db.json")
+            out_dir = os.path.join(tmp, "collection")
+            catalog = AnimeCatalogManager(db_path=db_path)
+            catalog._db["animes"]["air-gear"] = {
+                "last_scanned": "2026-11-25T00:00:00Z",
+                "folder_path": "",
+                "linked_playlists": [],
+                "entries": [],
+            }
+            catalog._save_db()
+            res = catalog.download_anime_entries("air-gear", out_folder=out_dir)
+            assert res["downloaded_count"] == 0
+            assert res["todo_count"] == 0
+            assert os.path.isdir(os.path.join(out_dir, "Air Gear"))
+            assert os.path.isfile(os.path.join(out_dir, "Air Gear", "CD_TODO_LIST.md"))
+            assert os.path.isfile(os.path.join(out_dir, "Air Gear", "catalog.json"))
+

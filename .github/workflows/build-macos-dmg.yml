@@ -1,0 +1,120 @@
+name: Build macOS DMG App
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - "feat/**"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS DMG (Apple Silicon arm64)
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install official python.org Universal2 Python 3.12 (contains native arm64 slice)
+        run: |
+          curl -fSL https://www.python.org/ftp/python/3.12.8/python-3.12.8-macos11.pkg -o /tmp/python-universal2.pkg
+          sudo installer -pkg /tmp/python-universal2.pkg -target /
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 --version
+          lipo -info /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m venv .venv-u2
+
+      - name: Install runtime and universal2 macOS packaging dependencies
+        run: |
+          source .venv-u2/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywebview pyobjc-framework-Cocoa pyobjc-framework-WebKit pytest
+
+      - name: Run unit tests
+        run: |
+          source .venv-u2/bin/activate
+          python -m pytest Tests/test_spotify_and_verification.py Tests/test_helper.py -v
+
+      - name: Generate native macOS .icns icon
+        run: |
+          source .venv-u2/bin/activate
+          python packaging/make_icon.py packaging/SaavnDownloader.iconset
+          iconutil -c icns packaging/SaavnDownloader.iconset -o packaging/SaavnDownloader.icns
+
+      - name: Build native Apple Silicon (arm64) Saavn-Downloader Studio.app
+        run: |
+          source .venv-u2/bin/activate
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --onedir \
+            --target-arch arm64 \
+            --name "Saavn-Downloader Studio" \
+            --icon "packaging/SaavnDownloader.icns" \
+            --osx-bundle-identifier "com.juanmirodas.saavndownloader.studio" \
+            --add-data "scripts/web_assets:scripts/web_assets" \
+            --hidden-import "webview.platforms.cocoa" \
+            --hidden-import "mutagen.mp4" \
+            desktop_app.py
+          lipo -info "dist/Saavn-Downloader Studio.app/Contents/MacOS/Saavn-Downloader Studio"
+          file "dist/Saavn-Downloader Studio.app/Contents/MacOS/Saavn-Downloader Studio"
+
+      - name: Ad-hoc sign .app bundle
+        run: |
+          codesign --force --deep --sign - "dist/Saavn-Downloader Studio.app"
+          codesign --verify --deep --strict "dist/Saavn-Downloader Studio.app" || true
+
+      - name: Create drag-to-Applications DMG
+        run: |
+          mkdir -p dist/dmg_staging
+          cp -R "dist/Saavn-Downloader Studio.app" dist/dmg_staging/
+          ln -s /Applications dist/dmg_staging/Applications
+          DMG_NAME="Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg"
+          hdiutil create \
+            -volname "Saavn-Downloader Studio" \
+            -srcfolder dist/dmg_staging \
+            -ov \
+            -format UDZO \
+            "dist/${DMG_NAME}"
+          ls -lh "dist/${DMG_NAME}"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Saavn-Downloader-Studio-macOS-arm64-AppleSilicon
+          path: dist/Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg
+
+      - name: Publish GitHub Release with DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="studio-latest"
+          TITLE="Saavn-Downloader Studio (macOS Apple Silicon DMG)"
+          cat <<'EOF' > release_notes.md
+          ## Saavn-Downloader Studio for macOS (Apple Silicon — M1 / M2 / M3 / M4)
+
+          Download **`Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg`** below.
+
+          ### Installation on macOS
+          1. Open the `.dmg` and drag **Saavn-Downloader Studio.app** into **Applications**.
+          2. Because this build is ad-hoc signed (not notarized with a paid Apple Developer ID), the first time you launch it: **right-click → Open**, or run in Terminal:
+             ```sh
+             xattr -cr "/Applications/Saavn-Downloader Studio.app"
+             ```
+          3. Downloads are saved by default to `~/Music/Saavn-Downloader`, and your 83-Anime Collection Gallery & CD To-Do progress is stored in `~/Library/Application Support/Saavn-Downloader/`.
+          EOF
+          sed -i '' 's/^          //' release_notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file release_notes.md --target "${{ github.sha }}"
+          else
+            gh release create "$TAG" dist/Saavn-Downloader-Studio-macOS-arm64-AppleSilicon.dmg --title "$TITLE" --notes-file release_notes.md --target "${{ github.sha }}"
+          fi
