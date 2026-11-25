@@ -1,29 +1,49 @@
 # Saavn Downloader
 The fullset of functionality offered are:
-  - High Qualtiy - MP4 (320 Kbps bitrate)
-  - Songs with metadata
-  - Download Individual Song
-  - Download PlayList
-  - Download Album
-  - Download all Albums of an Artist as Albums
-  - Download all Songs of an Artist as Songs
-  - Download Entire PlayList from user profile
-  - Download Entire Albums from user profile
-  - Download Entire JioSaavn Originals and Podcasts in the user profile
-  - Clone an account to a new account (Created via script)
-  - Clone an account to another account
-  - Create a new account
+  - High Quality - MP4 (320 Kbps bitrate, with graceful 160/96 Kbps fallback)
+  - Songs with rich metadata & highest-resolution album covers (iTunes up to 3000×3000 → Spotify 640×640 → JioSaavn 500×500)
+  - **Spotify Playlists & Albums → JioSaavn** with configurable single/album expansion (`--include-albums`, `--max-album-tracks N`)
+  - **Original-Artist & Cover/Karaoke Verification** (auto-crosschecks One Piece Openings/Endings from One Piece Wiki + general cover/karaoke/lofi/wrong-artist detection; flags & disables copies by default)
+  - **Automatic CD To-Do List (`CD_TODO_LIST.md`)** for flagged covers, missing official themes, and tracks unavailable on JioSaavn
+  - **Local Studio Web UI & 83-Anime Collection Gallery (`--web`)** for Japanese Openings, Endings, Movie Singles & Character Song Singles (soundtracks/OSTs excluded)
+  - Download Individual Song, Playlist, Album, or Artist from JioSaavn
+  - Download Entire PlayList, Albums, JioSaavn Originals and Podcasts from user profile
+  - Clone or Create JioSaavn accounts
  
-###### Python 3.10.* recommended if you are installing it fresh for the project
+###### Python 3.10.*+ recommended if you are installing it fresh for the project
 
 ### Installation
 ```sh
 $ pip install -r requirements.txt
+# or with uv:
+$ uv sync
 ```
 
 ### Usage
 
-#### Download Song, Playlist, Album from Web URL
+#### Launch the Studio Web UI & 83-Anime Collection Gallery
+```sh
+$ python main.py --web
+# Open http://127.0.0.1:8765 (custom port: --port 9000, output folder: -o /path/to/music)
+```
+
+#### Download a Spotify Playlist from JioSaavn (with Verification & Single Expansion)
+```sh
+# Interactive review (downloads songs only into "One Piece Openings (1-29)/"):
+$ python main.py -u https://open.spotify.com/playlist/4IQUdsVry6H16OT9e19Ldz
+
+# Also expand full singles/EPs up to 6 tracks (e.g., 4-track single expanded into a subfolder, 13-track album kept as song-only):
+$ python main.py -u https://open.spotify.com/playlist/4IQUdsVry6H16OT9e19Ldz --include-albums --max-album-tracks 6
+
+# Analyze, crosscheck, and export CD_TODO_LIST.md without downloading audio:
+$ python main.py -u https://open.spotify.com/playlist/4v6JxXh5OonEhXn2suacOO --include-albums --max-album-tracks 6 --dry-run -y
+
+# List or scan any of the 83 built-in Japanese anime series into the Gallery & CD To-Do archive:
+$ python main.py --list-animes
+$ python main.py --scan-anime one-piece
+```
+
+#### Download Song, Playlist, Album from JioSaavn Web URL
 ```sh
 $ python main.py
 $ Paste the URL: https://www.jiosaavn.com/album/tum-hi-aana-from-marjaavaan/j9bfphC2728_

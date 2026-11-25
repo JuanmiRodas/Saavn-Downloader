@@ -7,7 +7,13 @@ from typing import NoReturn
 import requests
 from tqdm import tqdm
 
+from .spotify_client import parse_spotify_url
+
 def scan_url(url):
+    spotify = parse_spotify_url(url)
+    if spotify is not None:
+        kind, _ = spotify
+        return f"spotify_{kind}"
     url_parts = url.split("/")
     if "album" in url_parts:
         return "album"
@@ -120,9 +126,27 @@ def argManager():
     parser.add_argument("-copy", "--copy", action="store_true", help="To copy to another account")
 
     parser.add_argument("-o", "--outFolder", help="Path to store the Downloaded songs folder")
-    parser.add_argument("-u", "--url", help="URL of the song, playlist, album, artist")
+    parser.add_argument("-u", "--url", help="URL of the song, playlist, album, artist (JioSaavn or Spotify)")
     parser.add_argument("-e", "--email", help="Email of the Jio Saavn User")
     parser.add_argument("-pw", "--password", help="Password of the Jio Saavn User")
     parser.add_argument("-f", "--file", help="file with the urls of songs, albums, playlists, artists")
+
+    # Spotify -> JioSaavn, verification & Anime Gallery options
+    parser.add_argument("--web", action="store_true", help="Launch local Studio Web UI & Anime Collection Gallery")
+    parser.add_argument("--port", type=int, default=8765, help="Port for --web server (default: 8765)")
+    parser.add_argument("--include-albums", action="store_true", help="Also download parent singles/albums up to --max-album-tracks")
+    parser.add_argument("--max-album-tracks", type=int, default=6, help="Max tracks in an album/single to expand (default: 6)")
+    parser.add_argument(
+        "--reference",
+        choices=["auto", "one-piece-openings", "one-piece-endings", "one-piece", "none"],
+        default="auto",
+        help="Reference crosscheck list for Spotify playlists (default: auto)",
+    )
+    parser.add_argument("--strict-versions", action="store_true", help="Flag alternate/re-recorded versions by original artists")
+    parser.add_argument("-y", "--no-interactive", action="store_true", help="Skip interactive track selection prompt")
+    parser.add_argument("--dry-run", action="store_true", help="Analyze, crosscheck, and export CD_TODO_LIST.md without downloading")
+    parser.add_argument("--proxy", help="Optional HTTP/HTTPS proxy URL for JioSaavn requests")
+    parser.add_argument("--list-animes", action="store_true", help="List all 83 supported anime series slugs")
+    parser.add_argument("--scan-anime", help="Scan an anime slug from the catalog (e.g. one-piece) to build its Gallery & CD To-Do list")
     args = parser.parse_args()
     return args
