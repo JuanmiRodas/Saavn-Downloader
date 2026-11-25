@@ -908,3 +908,148 @@ input:focus, select:focus {
   font-weight: 500;
   box-shadow: var(--shadow-md);
 }
+
+/* Live Activity Log Console */
+.log-card {
+  margin-top: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+.log-header {
+  list-style: none;
+  padding: 10px 16px;
+  background: var(--surface-subtle);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.log-header::-webkit-details-marker {
+  display: none;
+}
+
+.log-card:not([open]) .log-header {
+  border-bottom: 0;
+}
+
+.log-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.log-title {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+}
+
+.log-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #a8a29e;
+  flex-shrink: 0;
+}
+
+.log-dot.live {
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.22);
+}
+
+.log-path-hint {
+  font-size: 11px;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.log-filter-pills {
+  display: flex;
+  gap: 4px;
+  margin-right: 4px;
+}
+
+.pill-sm {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+
+.log-console {
+  background: #171614;
+  color: #e7e5e0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  padding: 10px 14px;
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.log-empty {
+  color: #a8a29e;
+  padding: 6px 2px;
+}
+
+.log-line {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  word-break: break-word;
+}
+
+.log-line:last-child {
+  border-bottom: 0;
+}
+
+.log-ts {
+  color: #8c857d;
+  flex-shrink: 0;
+}
+
+.log-tag {
+  font-weight: 600;
+  flex-shrink: 0;
+  min-width: 92px;
+}
+
+.log-tag-match { color: #4ade80; }
+.log-tag-saavn { color: #fbbf24; }
+.log-tag-playlist { color: #60a5fa; }
+.log-tag-wiki { color: #c084fc; }
+.log-tag-crosscheck { color: #38bdf8; }
+.log-tag-itunes { color: #f472b6; }
+.log-tag-folder { color: #34d399; }
+.log-tag-autopilot { color: #fb923c; }
+.log-tag-error { color: #f87171; }
+.log-tag-default { color: #d6d3cd; }
+
+.log-msg {
+  color: #f3f1ec;
+  flex: 1;
+}
+
+.log-line.lvl-warn .log-msg { color: #fde68a; }
+.log-line.lvl-error .log-msg { color: #fca5a5; }
+

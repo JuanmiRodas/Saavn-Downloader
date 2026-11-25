@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .activity_log import activity_log, log_event
 from .anime_catalog import ANIME_FRANCHISES, AnimeCatalogManager, FRANCHISE_BY_SLUG
 from .content.spotify_playlist import SpotifyPlaylistDownloader
 from .helper import setProxy
@@ -86,6 +87,7 @@ class AppState:
                 self.jobs[job_id]["result"] = result
 
     def fail_job(self, job_id: str, error: str) -> None:
+        log_event("ERROR", f"Job {job_id} failed: {error}", level="ERROR")
         with self.lock:
             if job_id in self.jobs:
                 self.jobs[job_id]["status"] = "error"
@@ -148,7 +150,22 @@ def make_handler(state: AppState):
             qs = parse_qs(parsed.query)
 
             if path == "/api/config":
-                self._send_json({"out_folder": state.out_folder, "proxy_url": state.proxy_url})
+                self._send_json(
+                    {
+                        "out_folder": state.out_folder,
+                        "proxy_url": state.proxy_url,
+                        "log_path": activity_log.log_path,
+                    }
+                )
+                return
+
+            if path == "/api/logs":
+                try:
+                    since = int((qs.get("since") or ["0"])[0])
+                except ValueError:
+                    since = 0
+                seq, entries = activity_log.get_since(since_seq=since)
+                self._send_json({"seq": seq, "log_path": activity_log.log_path, "entries": entries})
                 return
 
             if path.startswith("/api/jobs/"):
@@ -326,6 +343,29 @@ def make_handler(state: AppState):
                 self._send_json({"cancelled": ok}, 200 if ok else 404)
                 return
 
+            if path == "/api/logs/clear":
+                activity_log.clear()
+                self._send_json({"cleared": True})
+                return
+
+            if path == "/api/open-log":
+                log_path = activity_log.log_path
+                try:
+                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                    if not os.path.exists(log_path):
+                        with open(log_path, "a", encoding="utf-8"):
+                            pass
+                    if sys.platform == "darwin":
+                        subprocess.Popen(["open", "-R", log_path])
+                    elif sys.platform.startswith("linux"):
+                        subprocess.Popen(["xdg-open", os.path.dirname(log_path)])
+                    elif sys.platform == "win32":
+                        os.startfile(os.path.dirname(log_path))  # type: ignore[attr-defined]
+                    self._send_json({"opened": log_path})
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
             if path == "/api/open-folder":
                 folder = (body.get("path") or state.out_folder).strip() or state.out_folder
                 os.makedirs(folder, exist_ok=True)
@@ -347,6 +387,7 @@ def make_handler(state: AppState):
                 include_singles = bool(body.get("include_singles", True))
                 max_album_tracks = max(1, int(body.get("max_album_tracks", 6) or 6))
                 skip_scanned = bool(body.get("skip_already_scanned", False))
+                strict_versions = bool(body.get("strict_versions", True))
                 proxy_override = body.get("proxy_url")
                 if proxy_override is not None:
                     state.proxy_url = proxy_override.strip()
@@ -365,6 +406,7 @@ def make_handler(state: AppState):
                             include_singles=include_singles,
                             max_album_tracks=max_album_tracks,
                             skip_already_scanned=skip_scanned,
+                            strict_versions=strict_versions,
                             cancel_event=cancel_ev,
                             progress_callback=lambda msg, pct: state.update_job(job_id, msg, pct),
                         )
@@ -385,6 +427,7 @@ def make_handler(state: AppState):
                 state.out_folder = out_folder
                 include_singles = bool(body.get("include_singles", True))
                 max_album_tracks = max(1, int(body.get("max_album_tracks", 6) or 6))
+                strict_versions = bool(body.get("strict_versions", True))
                 proxy_override = body.get("proxy_url")
                 if proxy_override is not None:
                     state.proxy_url = proxy_override.strip()
@@ -402,6 +445,7 @@ def make_handler(state: AppState):
                             include_singles=include_singles,
                             max_album_tracks=max_album_tracks,
                             skip_already_scanned=False,
+                            strict_versions=strict_versions,
                             cancel_event=cancel_ev,
                             progress_callback=lambda msg, pct: state.update_job(job_id, msg, pct),
                         )
@@ -461,6 +505,7 @@ def make_handler(state: AppState):
                     return
                 check_saavn = bool(body.get("check_saavn", True))
                 enrich_itunes = bool(body.get("enrich_itunes", True))
+                strict_versions = bool(body.get("strict_versions", True))
                 proxy_override = body.get("proxy_url")
                 job_id = state.create_job("scan_anime")
 
@@ -468,11 +513,12 @@ def make_handler(state: AppState):
                     try:
                         proxies, headers = state.get_proxies_headers(proxy_override)
                         catalog = AnimeCatalogManager(proxies=proxies, headers=headers)
-                        state.update_job(job_id, f"Fetching Wikipedia / Wiki themes for {FRANCHISE_BY_SLUG[slug].name}...", 10)
+                        state.update_job(job_id, f"Fetching playlists & wikis for {FRANCHISE_BY_SLUG[slug].name}...", 10)
                         gallery = catalog.scan_anime(
                             slug,
                             check_saavn=check_saavn,
                             enrich_itunes=enrich_itunes,
+                            strict_versions=strict_versions,
                             progress_callback=lambda done, total: state.update_job(
                                 job_id,
                                 f"Resolving singles, 3000px covers & JioSaavn ({done}/{total})...",

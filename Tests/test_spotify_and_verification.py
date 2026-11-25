@@ -10,9 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import helper
+from scripts.activity_log import ActivityLogger, activity_log
 from scripts.anime_catalog import (
     ANIME_FRANCHISES,
+    FRANCHISE_BY_SLUG,
     AnimeCatalogManager,
+    _extract_ja_wiki_themes,
     detect_anime_franchise,
     is_soundtrack_album,
 )
@@ -338,6 +341,7 @@ class TestArtworkAndTodoAndCatalog:
                 body = r.read()
                 assert b"Saavn-Downloader Studio" in body
                 assert b"Run All 83 Animes" in body
+                assert b"Live Activity Log" in body
                 assert b"music.youtube.com" not in body
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/animes") as r:
                 data = json.loads(r.read().decode("utf-8"))
@@ -345,6 +349,68 @@ class TestArtworkAndTodoAndCatalog:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/animes/one-piece") as r:
                 gal = json.loads(r.read().decode("utf-8"))
                 assert gal["franchise"]["slug"] == "one-piece"
+            activity_log.log("TEST", "Smoke log event for /api/logs")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/logs?since=0") as r:
+                log_data = json.loads(r.read().decode("utf-8"))
+                assert log_data["seq"] >= 1
+                assert any(e["tag"] == "TEST" and "Smoke log event" in e["message"] for e in log_data["entries"])
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_activity_logger_persists_and_filters_since(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = os.path.join(tmp, "studio.log")
+            logger = ActivityLogger(max_entries=10, log_path=log_file)
+            e1 = logger.log("WIKI", "Loaded Air Gear")
+            e2 = logger.log("SAAVN", "0 official matches", level="WARN")
+            assert e2["seq"] > e1["seq"]
+            seq, since_e1 = logger.get_since(since_seq=e1["seq"])
+            assert seq == e2["seq"]
+            assert len(since_e1) == 1
+            assert since_e1[0]["tag"] == "SAAVN"
+            assert os.path.isfile(log_file)
+            with open(log_file, "r", encoding="utf-8") as fh:
+                txt = fh.read()
+            assert "[WIKI] Loaded Air Gear" in txt
+            assert "[WARN] [SAAVN] 0 official matches" in txt
+            logger.clear()
+            _, after_clear = logger.get_since(0)
+            assert after_clear == []
+
+    def test_ja_wiki_inline_heading_extraction_air_gear(self):
+        wikitext = """=== 主題歌 ===
+; オープニングテーマ「[[Chain (BACK-ONの曲)|Chain]]」
+: 作詞 - TEEDA, KENJI03 / 作曲・編曲・唄 - [[BACK-ON]]
+; エンディングテーマ「SKY-2-HIGH」
+: 制作 - [[skankfunk]]
+"""
+        songs = _extract_ja_wiki_themes(wikitext, FRANCHISE_BY_SLUG["air-gear"])
+        assert len(songs) == 2
+        assert songs[0]["category"] == "OP"
+        assert songs[0]["title"] == "Chain"
+        assert "BACK-ON" in songs[0]["artist"]
+        assert songs[1]["category"] == "ED"
+        assert songs[1]["title"] == "SKY-2-HIGH"
+        assert "skankfunk" in songs[1]["artist"]
+
+    def test_download_anime_entries_handles_zero_entries_without_crash(self):
+        """Regression test: 0-entry series must never crash run_autopilot on the 2nd anime."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "db.json")
+            out_dir = os.path.join(tmp, "collection")
+            catalog = AnimeCatalogManager(db_path=db_path)
+            catalog._db["animes"]["air-gear"] = {
+                "last_scanned": "2026-11-25T00:00:00Z",
+                "folder_path": "",
+                "linked_playlists": [],
+                "entries": [],
+            }
+            catalog._save_db()
+            res = catalog.download_anime_entries("air-gear", out_folder=out_dir)
+            assert res["downloaded_count"] == 0
+            assert res["todo_count"] == 0
+            assert os.path.isdir(os.path.join(out_dir, "Air Gear"))
+            assert os.path.isfile(os.path.join(out_dir, "Air Gear", "CD_TODO_LIST.md"))
+            assert os.path.isfile(os.path.join(out_dir, "Air Gear", "catalog.json"))
+

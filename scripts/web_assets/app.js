@@ -10,6 +10,11 @@
     currentTodoMarkdown: "",
     currentTodoDownloadUrl: "",
     activeJobId: null,
+    logSeq: 0,
+    logEntries: [],
+    logFilter: "all",
+    logPath: "",
+    logTimer: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -40,13 +45,152 @@
     return data;
   }
 
+  // ======================== LIVE ACTIVITY LOG ========================
+  function logMatchesFilter(entry) {
+    const f = state.logFilter;
+    if (f === "all") return true;
+    const tag = (entry.tag || "").toUpperCase();
+    const lvl = (entry.level || "").toUpperCase();
+    if (f === "saavn") return tag === "SAAVN" || tag === "MATCH" || tag === "DOWNLOAD";
+    if (f === "discovery") {
+      return ["PLAYLIST", "WIKI", "CROSSCHECK", "ITUNES", "SCAN", "AUTOPILOT", "FOLDER"].includes(tag);
+    }
+    if (f === "issues") return lvl === "WARN" || lvl === "ERROR" || tag === "ERROR";
+    return true;
+  }
+
+  function logTagClass(tag) {
+    const t = (tag || "").toLowerCase();
+    if (["match", "saavn", "playlist", "wiki", "crosscheck", "itunes", "folder", "autopilot", "error"].includes(t)) {
+      return `log-tag-${t}`;
+    }
+    return "log-tag-default";
+  }
+
+  function renderLogs() {
+    const box = $("activity-log-body");
+    if (!box) return;
+    const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 36;
+    const visible = state.logEntries.filter(logMatchesFilter);
+    $("log-count-badge").textContent = `${state.logEntries.length} line${state.logEntries.length === 1 ? "" : "s"}`;
+    if (state.logPath) {
+      $("log-file-path").textContent = state.logPath;
+      $("log-file-path").title = state.logPath;
+    }
+
+    if (visible.length === 0) {
+      box.innerHTML = `<div class="log-empty">${
+        state.logEntries.length === 0
+          ? 'Ready. Click "▶ Scan &amp; Download This Anime" or "⚡ Run All 83 Animes" to inspect live playlist discovery, wiki crosschecks, and exact JioSaavn API candidates here.'
+          : "No log lines match the current filter."
+      }</div>`;
+      return;
+    }
+
+    box.innerHTML = visible
+      .map((e) => {
+        const lvlCls = e.level === "ERROR" ? "lvl-error" : e.level === "WARN" ? "lvl-warn" : "";
+        return `<div class="log-line ${lvlCls}"><span class="log-ts">${escapeHtml(e.ts)}</span><span class="log-tag ${logTagClass(e.tag)}">[${escapeHtml(e.tag)}]</span><span class="log-msg">${escapeHtml(e.message)}</span></div>`;
+      })
+      .join("");
+
+    if (wasAtBottom) {
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  async function fetchLogsOnce() {
+    try {
+      const data = await apiJson(`/api/logs?since=${state.logSeq}`);
+      if (data.log_path) state.logPath = data.log_path;
+      const incoming = data.entries || [];
+      if (incoming.length > 0) {
+        state.logEntries.push(...incoming);
+        if (state.logEntries.length > 2000) {
+          state.logEntries = state.logEntries.slice(-2000);
+        }
+        state.logSeq = data.seq || state.logSeq;
+        renderLogs();
+      } else if (data.log_path && !$("log-file-path").textContent) {
+        renderLogs();
+      }
+    } catch (_) {}
+  }
+
+  function startLogStreaming() {
+    $("log-live-dot")?.classList.add("live");
+    fetchLogsOnce();
+    if (!state.logTimer) {
+      state.logTimer = setInterval(fetchLogsOnce, 900);
+    }
+  }
+
+  function stopLogStreaming() {
+    $("log-live-dot")?.classList.remove("live");
+    if (state.logTimer) {
+      clearInterval(state.logTimer);
+      state.logTimer = null;
+    }
+    fetchLogsOnce();
+  }
+
+  $("log-filters")?.querySelectorAll(".pill").forEach((p) => {
+    p.addEventListener("click", () => {
+      $("log-filters").querySelectorAll(".pill").forEach((x) => x.classList.remove("active"));
+      p.classList.add("active");
+      state.logFilter = p.dataset.lfilter;
+      renderLogs();
+    });
+  });
+
+  $("btn-copy-log")?.addEventListener("click", async () => {
+    const text = state.logEntries
+      .map((e) => `[${e.ts}] [${e.level}] [${e.tag}] ${e.message}`)
+      .join("\n");
+    if (!text) {
+      showToast("Activity log is empty.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Copied ${state.logEntries.length} log line(s) to clipboard`);
+    } catch (err) {
+      showToast(`Copy failed: ${err.message}`);
+    }
+  });
+
+  $("btn-open-log")?.addEventListener("click", async () => {
+    try {
+      const data = await apiJson("/api/open-log", { method: "POST", body: "{}" });
+      showToast(`Revealed ${data.opened}`);
+    } catch (err) {
+      showToast(`Could not open log file: ${err.message}`);
+    }
+  });
+
+  $("btn-clear-log")?.addEventListener("click", async () => {
+    try {
+      await apiJson("/api/logs/clear", { method: "POST", body: "{}" });
+      state.logEntries = [];
+      renderLogs();
+      showToast("Cleared in-app log view (studio.log kept on disk)");
+    } catch (err) {
+      showToast(`Clear failed: ${err.message}`);
+    }
+  });
+
   async function pollJob(jobId, onProgress) {
-    while (true) {
-      const job = await apiJson(`/api/jobs/${jobId}`);
-      if (onProgress) onProgress(job.message || "Working...", job.progress || 0);
-      if (job.status === "completed") return job.result;
-      if (job.status === "error") throw new Error(job.error || "Background job failed");
-      await new Promise((r) => setTimeout(r, 450));
+    startLogStreaming();
+    try {
+      while (true) {
+        const job = await apiJson(`/api/jobs/${jobId}`);
+        if (onProgress) onProgress(job.message || "Working...", job.progress || 0);
+        if (job.status === "completed") return job.result;
+        if (job.status === "error") throw new Error(job.error || "Background job failed");
+        await new Promise((r) => setTimeout(r, 450));
+      }
+    } finally {
+      stopLogStreaming();
     }
   }
 
@@ -62,14 +206,18 @@
     }
   }
 
-  // Tabs
+  // Tabs (and dock the Live Activity Log into the active tab)
   document.querySelectorAll(".nav-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".nav-tab").forEach((b) => b.classList.remove("active"));
       document.querySelectorAll(".workspace").forEach((w) => w.classList.remove("active"));
       btn.classList.add("active");
-      $(`view-${btn.dataset.view}`).classList.add("active");
-      if (btn.dataset.view === "gallery") {
+      const view = btn.dataset.view;
+      $(`view-${view}`).classList.add("active");
+      const logPanel = $("activity-log-panel");
+      const targetMount = view === "playlist" ? $("log-mount-playlist") : $("log-mount-gallery");
+      if (logPanel && targetMount) targetMount.appendChild(logPanel);
+      if (view === "gallery") {
         loadAnimesList(false);
       }
     });
@@ -373,6 +521,7 @@
           out_folder: $("gal-out-folder").value.trim(),
           include_singles: $("gal-include-singles").checked,
           max_album_tracks: parseInt($("gal-max-tracks").value || "6", 10),
+          strict_versions: $("gal-strictness").value !== "relaxed",
           proxy_url: $("gal-proxy-url").value.trim(),
         }),
       });
@@ -414,6 +563,7 @@
           include_singles: $("gal-include-singles").checked,
           max_album_tracks: parseInt($("gal-max-tracks").value || "6", 10),
           skip_already_scanned: $("gal-skip-scanned").checked,
+          strict_versions: $("gal-strictness").value !== "relaxed",
           proxy_url: $("gal-proxy-url").value.trim(),
         }),
       });
@@ -797,7 +947,11 @@
       $("gal-out-folder").value = cfg.out_folder || "";
       $("proxy-url").value = cfg.proxy_url || "";
       $("gal-proxy-url").value = cfg.proxy_url || "";
+      if (cfg.log_path) {
+        state.logPath = cfg.log_path;
+        renderLogs();
+      }
     } catch (_) {}
-    await loadAnimesList(true);
+    await Promise.all([loadAnimesList(true), fetchLogsOnce()]);
   })();
 })();

@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import requests
 
+from .activity_log import log_event
 from .artwork_and_tags import ArtworkInfo, HighResArtworkFetcher, write_rich_mp4_tags
 from .download_manager import Manager
 from .reference_checker import (
@@ -224,38 +225,54 @@ def _extract_ja_wiki_themes(wikitext: str, franchise: AnimeFranchise) -> list[di
         line = raw.strip()
         if not line:
             continue
-        if re.search(r"オープニングテーマ|オープニング", line) and (line.startswith(";") or line.startswith("=") or line.startswith("'''")):
-            current_category = "OP"
-            continue
-        if re.search(r"エンディングテーマ|エンディング", line) and (line.startswith(";") or line.startswith("=") or line.startswith("'''")):
-            current_category = "ED"
-            continue
-        if re.search(r"挿入歌|劇中歌", line) and (line.startswith(";") or line.startswith("=") or line.startswith("'''")):
-            current_category = "Insert"
-            continue
-        if re.search(r"キャラクターソング|キャラソン", line) and (line.startswith(";") or line.startswith("=") or line.startswith("'''")):
-            current_category = "Character"
-            continue
-        if re.search(r"劇場版|映画", line) and (line.startswith(";") or line.startswith("=")):
-            current_category = "Movie"
-            continue
+        is_heading_prefix = line.startswith(";") or line.startswith("=") or line.startswith("'''")
+        has_inline_title = bool(re.search(r"[「『]([^」』]{1,80})[」』]", line))
+        if is_heading_prefix:
+            if re.search(r"オープニングテーマ|オープニング", line):
+                current_category = "OP"
+                if not has_inline_title:
+                    continue
+            elif re.search(r"エンディングテーマ|エンディング", line):
+                current_category = "ED"
+                if not has_inline_title:
+                    continue
+            elif re.search(r"挿入歌|劇中歌", line):
+                current_category = "Insert"
+                if not has_inline_title:
+                    continue
+            elif re.search(r"キャラクターソング|キャラソン", line):
+                current_category = "Character"
+                if not has_inline_title:
+                    continue
+            elif re.search(r"劇場版|映画", line):
+                current_category = "Movie"
+                if not has_inline_title:
+                    continue
 
         # Japanese Wikipedia pattern: 「Song Title」（episodes） followed by 歌 - Artist / 作詞...
         title_match = re.search(r"[「『]([^」』]{1,80})[」』]", line)
         if not title_match:
             continue
 
-        # Check current line and next 2 lines for singer ("歌 - ..." or "歌：..." or "歌 / ...")
-        context_block = "\n".join(lines[i : min(len(lines), i + 3)])
+        # Check current line and subsequent credit lines (stopping at the next heading/theme entry)
+        context_lines = [_clean_wiki_markup(line)]
+        for nxt_raw in lines[i + 1 : min(len(lines), i + 4)]:
+            nxt = nxt_raw.strip()
+            if not nxt or nxt.startswith(";") or nxt.startswith("=") or nxt.startswith("*"):
+                break
+            if re.search(r"[「『][^」』]{1,80}[」』]", nxt):
+                break
+            context_lines.append(_clean_wiki_markup(nxt))
+        context_block = "\n".join(context_lines)
         artist_match = re.search(
-            r"(?:歌|唄|歌唱|アーティスト|演奏)\s*[-ー:：・/]\s*([^\n、,。/（(]+)",
-            _clean_wiki_markup(context_block),
+            r"(?:歌|唄|歌唱|アーティスト|演奏|制作)\s*[-ー:：・/]\s*([^\n;；=、,。/（(]+)",
+            context_block,
         )
         if not artist_match:
             continue
 
         title = _clean_wiki_markup(title_match.group(1))
-        artist = _clean_wiki_markup(artist_match.group(1))
+        artist = artist_match.group(1).strip()
         artist = re.sub(r"\s*[\(（].*$", "", artist)
         artist = re.sub(r"\s*[:：]\s*(?:第?\d+期|最終期|シーズン\d+|OVA|劇場版).*$", "", artist).strip()
         if not title or not artist or len(title) > 80 or len(artist) > 60:
@@ -460,47 +477,62 @@ class AnimeCatalogManager:
                 return entry
         return None
 
-    def _fetch_wiki_section_wikitext(self, lang: str, page: str) -> str:
+    def _fetch_wiki_section_wikitext(self, lang: str, page: str, fallback_query: str = "") -> str:
         api = f"https://{lang}.wikipedia.org/w/api.php"
+        resolved_page = page
         try:
             sec_resp = self.session.get(
                 api,
-                params={"action": "parse", "page": page, "prop": "sections", "format": "json"},
+                params={"action": "parse", "page": resolved_page, "prop": "sections", "format": "json"},
                 timeout=12,
             )
-            if sec_resp.status_code != 200:
+            data = sec_resp.json() if sec_resp.status_code == 200 else {}
+            # If exact page title doesn't exist, search Wikipedia automatically
+            if "parse" not in data and fallback_query:
+                sr = self.session.get(
+                    api,
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": fallback_query,
+                        "srlimit": 3,
+                        "format": "json",
+                    },
+                    timeout=10,
+                )
+                hits = sr.json().get("query", {}).get("search") or [] if sr.status_code == 200 else []
+                if hits:
+                    resolved_page = hits[0]["title"]
+                    log_event("WIKI", f"Resolved {lang}.wiki '{page}' -> '{resolved_page}'")
+                    sec_resp = self.session.get(
+                        api,
+                        params={"action": "parse", "page": resolved_page, "prop": "sections", "format": "json"},
+                        timeout=12,
+                    )
+                    data = sec_resp.json() if sec_resp.status_code == 200 else {}
+
+            if "parse" not in data:
                 return ""
-            sections = sec_resp.json().get("parse", {}).get("sections") or []
-            target_indices: list[str] = []
+
+            sections = data.get("parse", {}).get("sections") or []
+            high_priority: list[str] = []
+            low_priority: list[str] = []
             for s in sections:
                 line = s.get("line", "")
-                if any(
-                    kw in line.lower()
-                    for kw in (
-                        "theme",
-                        "opening",
-                        "ending",
-                        "music",
-                        "single",
-                        "character song",
-                        "主題歌",
-                        "オープニング",
-                        "エンディング",
-                        "音楽",
-                        "キャラクターソング",
-                    )
-                ):
-                    target_indices.append(str(s["index"]))
-            if not target_indices:
-                target_indices = ["0"]
+                low = line.lower()
+                if any(kw in low for kw in ("主題歌", "オープニング", "エンディング", "挿入歌", "theme", "opening", "ending")):
+                    high_priority.append(str(s["index"]))
+                elif any(kw in low for kw in ("音楽", "キャラクターソング", "single", "character song", "music")):
+                    low_priority.append(str(s["index"]))
 
+            target_indices = [*high_priority, *low_priority] or ["0"]
             chunks: list[str] = []
-            for idx in target_indices[:4]:
+            for idx in target_indices[:6]:
                 r = self.session.get(
                     api,
                     params={
                         "action": "parse",
-                        "page": page,
+                        "page": resolved_page,
                         "section": idx,
                         "prop": "wikitext",
                         "format": "json",
@@ -512,8 +544,114 @@ class AnimeCatalogManager:
                     if wt:
                         chunks.append(wt)
             return "\n".join(chunks)
-        except Exception:
+        except Exception as exc:
+            log_event("WIKI", f"Error fetching {lang}.wiki '{page}': {exc}", level="WARN")
             return ""
+
+    def _discover_playlist_tracks(
+        self, franchise: AnimeFranchise, linked_playlists: list[dict[str, str]]
+    ) -> list[dict[str, Any]]:
+        """Discover tracks from linked Spotify playlists first, then public streaming playlists (Deezer API)."""
+        discovered: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        # 1. Linked Spotify playlists (if present for this anime)
+        if linked_playlists:
+            from .spotify_client import SpotifyClient
+
+            sp = SpotifyClient(proxies=self.proxies)
+            for lp in linked_playlists[:2]:
+                pl_url = lp.get("url") or ""
+                if "spotify.com" not in pl_url:
+                    continue
+                try:
+                    log_event("PLAYLIST", f"{franchise.name}: loading linked Spotify playlist '{lp.get('label', pl_url)}'")
+                    pl = sp.fetch_playlist(pl_url, enrich_albums=False)
+                    for tr in pl.tracks:
+                        artist_str = ", ".join(tr.artists)
+                        if detect_cover_or_karaoke(tr.title, tr.artists):
+                            log_event("CROSSCHECK", f"Skipped Spotify cover/karaoke: '{tr.title}' by {artist_str}", level="WARN")
+                            continue
+                        key = (normalize_text(tr.title), normalize_text(artist_str))
+                        if key[0] and key not in seen:
+                            seen.add(key)
+                            discovered.append(
+                                {
+                                    "title": tr.title,
+                                    "artist": artist_str,
+                                    "duration_ms": tr.duration_ms,
+                                    "spotify_track_url": tr.url,
+                                    "source": "spotify_playlist",
+                                }
+                            )
+                except Exception as exc:
+                    log_event("PLAYLIST", f"Spotify playlist fetch failed ({pl_url}): {exc}", level="WARN")
+
+        # 2. Auto-discover public streaming playlists via Deezer open API (no API key needed!)
+        try:
+            short_name = re.sub(r"\s*\([^)]*\)", "", franchise.name).strip()
+            name_tokens = [
+                normalize_text(short_name),
+                normalize_text(franchise.jp_name),
+                *[normalize_text(a) for a in (franchise.aliases or []) if len(a) >= 4],
+            ]
+            name_tokens = [t for t in name_tokens if len(t) >= 3]
+            picked = None
+            for q in (f"{short_name} opening", f"{short_name} anime"):
+                r = self.session.get(
+                    "https://api.deezer.com/search/playlist",
+                    params={"q": q, "limit": 6},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    continue
+                for pl in r.json().get("data") or []:
+                    ptitle = pl.get("title") or ""
+                    pnorm = normalize_text(ptitle)
+                    nb = int(pl.get("nb_tracks") or 0)
+                    if not (2 <= nb <= 120):
+                        continue
+                    if any(tok in pnorm for tok in name_tokens):
+                        picked = pl
+                        break
+                if picked:
+                    break
+            if picked:
+                log_event(
+                    "PLAYLIST",
+                    f"{franchise.name}: auto-discovered streaming playlist '{picked.get('title')}' ({picked.get('nb_tracks')} tracks)",
+                )
+                tr_resp = self.session.get(
+                    f"https://api.deezer.com/playlist/{picked['id']}/tracks",
+                    params={"limit": 80},
+                    timeout=10,
+                )
+                if tr_resp.status_code == 200:
+                    for tr in tr_resp.json().get("data") or []:
+                        t_title = tr.get("title") or ""
+                        t_artist = (tr.get("artist") or {}).get("name") or ""
+                        t_album = (tr.get("album") or {}).get("title") or ""
+                        if is_soundtrack_album(t_album) or detect_cover_or_karaoke(t_title, [t_artist], album_name=t_album):
+                            continue
+                        key = (normalize_text(t_title), normalize_text(t_artist))
+                        if key[0] and key not in seen:
+                            seen.add(key)
+                            discovered.append(
+                                {
+                                    "title": t_title,
+                                    "artist": t_artist,
+                                    "album": t_album,
+                                    "cover_url": (tr.get("album") or {}).get("cover_xl") or (tr.get("album") or {}).get("cover_big"),
+                                    "duration_ms": int(tr.get("duration") or 0) * 1000,
+                                    "source": "streaming_playlist",
+                                }
+                            )
+            else:
+                log_event("PLAYLIST", f"{franchise.name}: no matching public playlist found — falling back to wiki + single-by-single search")
+        except Exception as exc:
+            log_event("PLAYLIST", f"{franchise.name}: playlist discovery error: {exc}", level="WARN")
+
+        return discovered
 
     def _resolve_itunes_single_metadata(
         self, title: str, artist: str, artist_aliases: list[str] | None = None
@@ -651,29 +789,41 @@ class AnimeCatalogManager:
         check_saavn: bool = True,
         enrich_itunes: bool = True,
         max_items: int = 80,
+        strict_versions: bool = True,
         progress_callback=None,
     ) -> dict[str, Any]:
-        """Discover openings, endings, movie/special themes, and character singles for an anime.
+        """Playlist-first + multi-wiki crosscheck + single-by-single fallback scanner.
 
-        Excludes soundtracks/OSTs, resolves official single metadata & 3000x3000 covers,
-        verifies JioSaavn availability, and builds Gallery cards (marking unavailable items as CD To-Do).
+        1. Checks linked Spotify playlists + auto-discovers public streaming playlists.
+        2. Fetches authoritative OP/ED/Movie/Character lists from wikis (JP/EN Wikipedia + One Piece Wiki).
+        3. Crosschecks playlist tracks against wikis (rejecting covers/wrong artists) & falls back to single-by-single iTunes lookup.
+        4. Verifies original recordings on JioSaavn and builds Gallery + CD To-Do cards.
         """
         franchise = FRANCHISE_BY_SLUG.get(slug)
         if not franchise:
             raise ValueError(f"Unknown anime slug: {slug}")
 
+        log_event("SCAN", f"=== Starting scan for {franchise.name} ({franchise.jp_name}) ===")
         existing_rec = (self._db.get("animes") or {}).get(slug) or {}
         existing_owned = {
             e.get("entry_id"): bool(e.get("owned_from_cd"))
             for e in (existing_rec.get("entries") or [])
         }
+        linked_playlists = existing_rec.get("linked_playlists") or list(franchise.default_playlists)
 
+        # Step 1: Discover streaming playlist tracks first (Spotify linked + Deezer public playlist)
+        playlist_tracks = self._discover_playlist_tracks(franchise, linked_playlists)
+        log_event("PLAYLIST", f"{franchise.name}: {len(playlist_tracks)} verified non-cover playlist candidate(s)")
+
+        # Step 2: Fetch authoritative theme lists from wikis
         raw_songs: list[dict[str, Any]] = []
-
-        # 1. Special authoritative provider for One Piece
         if slug == "one-piece":
             op_provider = OnePieceReferenceProvider(use_network=True)
-            for ref in op_provider.get_openings():
+            ops = op_provider.get_openings()
+            eds = op_provider.get_endings()
+            movies = op_provider.get_movie_themes()
+            log_event("WIKI", f"One Piece Wiki: {len(ops)} OPs, {len(eds)} EDs, {len(movies)} Movie themes")
+            for ref in ops:
                 raw_songs.append(
                     {
                         "category": "OP",
@@ -685,7 +835,7 @@ class AnimeCatalogManager:
                         "source": ref.source,
                     }
                 )
-            for ref in op_provider.get_endings():
+            for ref in eds:
                 raw_songs.append(
                     {
                         "category": "ED",
@@ -697,7 +847,7 @@ class AnimeCatalogManager:
                         "source": ref.source,
                     }
                 )
-            for ref in op_provider.get_movie_themes():
+            for ref in movies:
                 raw_songs.append(
                     {
                         "category": "Movie",
@@ -710,27 +860,60 @@ class AnimeCatalogManager:
                     }
                 )
         else:
-            # 2. Fetch from Japanese Wikipedia (most complete for anime OP/ED/Insert/Character songs)
             for jp_page in franchise.ja_wiki_pages:
-                wt = self._fetch_wiki_section_wikitext("ja", jp_page)
+                wt = self._fetch_wiki_section_wikitext("ja", jp_page, fallback_query=f"{franchise.jp_name} 主題歌")
                 if wt:
-                    raw_songs.extend(_extract_ja_wiki_themes(wt, franchise))
+                    extracted = _extract_ja_wiki_themes(wt, franchise)
+                    log_event("WIKI", f"ja.wiki '{jp_page}': extracted {len(extracted)} theme(s)")
+                    raw_songs.extend(extracted)
 
-            # 3. Also parse English Wikipedia if Japanese Wikipedia returned few items
             if len(raw_songs) < 4:
                 for en_page in franchise.en_wiki_pages:
-                    wt = self._fetch_wiki_section_wikitext("en", en_page)
+                    wt = self._fetch_wiki_section_wikitext("en", en_page, fallback_query=f"{franchise.name} theme songs")
                     if wt:
-                        raw_songs.extend(_extract_en_wiki_themes(wt, franchise))
+                        extracted = _extract_en_wiki_themes(wt, franchise)
+                        log_event("WIKI", f"en.wiki '{en_page}': extracted {len(extracted)} theme(s)")
+                        raw_songs.extend(extracted)
 
-            # 4. Also discover character song singles & theme singles on iTunes JP (filtering out OSTs)
-            if len(raw_songs) < 6:
+            # Step 3: Crosscheck discovered playlist tracks with wiki songs!
+            # If wiki found nothing (or very few), seed from non-cover playlist tracks;
+            # if wiki found tracks, attach matching streaming playlist metadata (duration/spotify_url/cover)
+            if playlist_tracks:
+                if len(raw_songs) == 0:
+                    log_event("CROSSCHECK", f"{franchise.name}: no wiki table parsed — using {len(playlist_tracks)} verified playlist tracks")
+                    for p_idx, pt in enumerate(playlist_tracks[:30], start=1):
+                        raw_songs.append(
+                            {
+                                "category": "OP",
+                                "number": p_idx,
+                                "title": pt["title"],
+                                "artist": pt["artist"],
+                                "episodes": "From streaming playlist",
+                                "playlist_meta": pt,
+                                "source": pt.get("source", "playlist"),
+                            }
+                        )
+                else:
+                    matched_pl = 0
+                    for item in raw_songs:
+                        for pt in playlist_tracks:
+                            t_ok = _similarity(pt["title"], item["title"]) >= 0.72
+                            a_ok, _ = _artist_matches([pt["artist"]], [item["artist"]])
+                            if t_ok and a_ok:
+                                item["playlist_meta"] = pt
+                                matched_pl += 1
+                                break
+                    log_event("CROSSCHECK", f"{franchise.name}: crosschecked {matched_pl}/{len(raw_songs)} wiki themes against streaming playlist")
+
+            # Step 4: Fallback single-by-single iTunes JP catalog discovery if still < 3 themes
+            if len(raw_songs) < 3:
+                log_event("ITUNES", f"{franchise.name}: running single-by-single catalog fallback search")
                 for query_suffix in ("主題歌", "キャラクターソング", ""):
                     q = f"{franchise.jp_name} {query_suffix}".strip()
                     try:
                         r = self.session.get(
                             "https://itunes.apple.com/search",
-                            params={"term": q, "entity": "album", "limit": 10, "country": "jp"},
+                            params={"term": q, "entity": "album", "limit": 8, "country": "jp"},
                             timeout=10,
                         )
                         if r.status_code == 200:
@@ -767,6 +950,8 @@ class AnimeCatalogManager:
             if len(deduped) >= max_items:
                 break
 
+        log_event("SCAN", f"{franchise.name}: {len(deduped)} unique theme/single item(s) queued for iTunes + JioSaavn verification")
+
         existing_downloaded = {
             e.get("entry_id"): list(e.get("downloaded_files") or [])
             for e in (existing_rec.get("entries") or [])
@@ -778,6 +963,7 @@ class AnimeCatalogManager:
             title = item["title"]
             artist = item["artist"]
             ref: ReferenceSong | None = item.get("reference")
+            pl_meta: dict[str, Any] = item.get("playlist_meta") or {}
             label = f"{cat} #{num}" if num else cat
             entry_id = f"{slug}:{cat.lower()}:{num or idx}:{normalize_text(title)[:24]}"
 
@@ -791,15 +977,19 @@ class AnimeCatalogManager:
 
             rom_title = itunes_meta.get("romanized_title", "")
             rom_artist = itunes_meta.get("romanized_artist", "")
-            duration_ms = int(itunes_meta.get("duration_ms") or 0)
+            duration_ms = int(itunes_meta.get("duration_ms") or pl_meta.get("duration_ms") or 0)
 
-            # Build enriched ReferenceSong combining wiki + iTunes US romanized aliases for strict JioSaavn matching
             title_aliases = list(ref.title_aliases) if ref else []
             artist_aliases = list(ref.artist_aliases) if ref else []
             if rom_title and rom_title not in title_aliases:
                 title_aliases.append(rom_title)
             if rom_artist and rom_artist not in artist_aliases:
                 artist_aliases.append(rom_artist)
+            if pl_meta.get("title") and pl_meta["title"] not in title_aliases:
+                title_aliases.append(pl_meta["title"])
+            if pl_meta.get("artist") and pl_meta["artist"] not in artist_aliases:
+                artist_aliases.append(pl_meta["artist"])
+
             effective_ref = ReferenceSong(
                 kind=ref.kind if ref else cat.lower(),
                 number=ref.number if ref else (num or idx),
@@ -819,6 +1009,7 @@ class AnimeCatalogManager:
                     artists=[artist, *([rom_artist] if rom_artist else [])],
                     duration_ms=duration_ms,
                     reference=effective_ref,
+                    strict_versions=strict_versions,
                 )
                 saavn_match_dict = match.to_dict() if match else None
                 saavn_note = note
@@ -834,6 +1025,20 @@ class AnimeCatalogManager:
             else:
                 status = "todo_cd"
 
+            cover_url = (
+                itunes_meta.get("cover_url")
+                or pl_meta.get("cover_url")
+                or (saavn_match_dict or {}).get("image_url")
+            )
+            cover_res = (
+                itunes_meta.get("cover_resolution")
+                or ("1000x1000" if pl_meta.get("cover_url") else ("500x500" if saavn_match_dict else ""))
+            )
+            cover_src = (
+                itunes_meta.get("cover_source")
+                or ("playlist" if pl_meta.get("cover_url") else ("jiosaavn" if saavn_match_dict else ""))
+            )
+
             return GalleryEntry(
                 entry_id=entry_id,
                 anime_slug=slug,
@@ -845,14 +1050,15 @@ class AnimeCatalogManager:
                 romanized_title=rom_title,
                 romanized_artist=rom_artist,
                 episodes_or_context=item.get("episodes", ""),
-                single_or_album=itunes_meta.get("single_or_album", ""),
+                single_or_album=itunes_meta.get("single_or_album") or pl_meta.get("album", ""),
                 single_track_count=itunes_meta.get("single_track_count"),
                 single_tracks=itunes_meta.get("single_tracks", []),
                 release_date=itunes_meta.get("release_date", ""),
                 label_company=itunes_meta.get("label_company", ""),
-                cover_url=itunes_meta.get("cover_url") or (saavn_match_dict or {}).get("image_url"),
-                cover_resolution=itunes_meta.get("cover_resolution") or ("500x500" if saavn_match_dict else ""),
-                cover_source=itunes_meta.get("cover_source") or ("jiosaavn" if saavn_match_dict else ""),
+                cover_url=cover_url,
+                cover_resolution=cover_res,
+                cover_source=cover_src,
+                spotify_track_url=pl_meta.get("spotify_track_url"),
                 saavn_match=saavn_match_dict,
                 saavn_note=saavn_note,
                 downloaded_files=prev_dl,
@@ -872,8 +1078,8 @@ class AnimeCatalogManager:
                     done += 1
                     try:
                         ordered[idx] = fut.result()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_event("SCAN", f"{franchise.name} item #{idx} error: {exc}", level="ERROR")
                     if progress_callback:
                         progress_callback(done, len(deduped))
                 entries = [ordered[k] for k in sorted(ordered.keys())]
@@ -881,10 +1087,12 @@ class AnimeCatalogManager:
         self._db.setdefault("animes", {})[slug] = {
             "last_scanned": datetime.now(timezone.utc).isoformat(),
             "folder_path": existing_rec.get("folder_path", ""),
-            "linked_playlists": existing_rec.get("linked_playlists") or list(franchise.default_playlists),
+            "linked_playlists": linked_playlists,
             "entries": [e.to_dict() for e in entries],
         }
         self._save_db()
+        matched_cnt = sum(1 for e in entries if e.saavn_match)
+        log_event("SCAN", f"Finished {franchise.name}: {len(entries)} entries ({matched_cnt} JioSaavn matches, {len(entries) - matched_cnt} CD To-Do)")
         return self.get_anime_gallery(slug)
 
     def download_anime_entries(
@@ -902,9 +1110,15 @@ class AnimeCatalogManager:
         if not franchise:
             raise ValueError(f"Unknown anime slug: {slug}")
 
-        rec = (self._db.get("animes") or {}).get(slug)
-        if not rec or not rec.get("entries"):
-            raise ValueError(f"Anime '{franchise.name}' has not been scanned yet.")
+        rec = (self._db.get("animes") or {}).setdefault(
+            slug,
+            {
+                "last_scanned": datetime.now(timezone.utc).isoformat(),
+                "folder_path": "",
+                "linked_playlists": list(franchise.default_playlists),
+                "entries": [],
+            },
+        )
 
         manager = Manager(out_folder=out_folder)
         anime_dir = manager.get_download_location(manager.sanitize_name(franchise.name))
@@ -989,6 +1203,7 @@ class AnimeCatalogManager:
                             comment=comment,
                             cover_bytes=cover_bytes,
                         )
+                        log_event("DOWNLOAD", f"Saved '{fname}' ({bitrate}, cover {cover_res}) -> {dest_dir}")
                     downloaded_total.append(
                         {
                             "file": loc,
@@ -1005,7 +1220,6 @@ class AnimeCatalogManager:
                         anime_dir,
                         manager.sanitize_name(f"{label} - {album_name}" if label else album_name),
                     )
-                    # Try JioSaavn album first if same track count <= max_album_tracks
                     saavn_alb_id = saavn_song.get("album_id")
                     saavn_alb_songs = self.saavn_matcher.fetch_album_songs(saavn_alb_id) if saavn_alb_id else []
                     if saavn_alb_songs and len(saavn_alb_songs) <= max_album_tracks:
@@ -1020,14 +1234,12 @@ class AnimeCatalogManager:
                             )
                             entry_files.append(loc)
                     else:
-                        # Match each track of the official single tracklist on JioSaavn (strictly verified!)
                         st_list = entry.get("single_tracks") or []
                         matched_any_extra = False
                         for st in st_list:
                             st_title = st.get("title") or ""
                             st_artist = st.get("artist") or artist
                             st_num = st.get("track_number")
-                            # Main track already matched
                             if _similarity(st_title, title) >= 0.8 or (
                                 entry.get("romanized_title") and _similarity(st_title, entry["romanized_title"]) >= 0.8
                             ):
@@ -1061,9 +1273,9 @@ class AnimeCatalogManager:
                     if not entry.get("owned_from_cd"):
                         entry["status"] = "downloaded"
             except Exception as exc:
+                log_event("DOWNLOAD", f"Error downloading '{title}': {exc}", level="ERROR")
                 errors.append({"entry_id": entry.get("entry_id"), "title": title, "error": str(exc)})
 
-        # Always write per-anime CD_TODO_LIST.md and catalog.json into the anime folder
         todo_path = os.path.join(anime_dir, "CD_TODO_LIST.md")
         with open(todo_path, "w", encoding="utf-8") as fh:
             fh.write(self.build_master_todo_markdown(slug))
@@ -1082,6 +1294,8 @@ class AnimeCatalogManager:
             )
 
         self._save_db()
+        todo_cnt = sum(1 for e in entries if e.get("status") in ("todo_cd", "flagged_cover") and not e.get("owned_from_cd"))
+        log_event("FOLDER", f"{franchise.name}: folder ready at {anime_dir} ({len(downloaded_total)} downloaded, {todo_cnt} CD To-Do)")
         return {
             "slug": slug,
             "anime_name": franchise.name,
@@ -1090,7 +1304,7 @@ class AnimeCatalogManager:
             "catalog_path": catalog_path,
             "downloaded_count": len(downloaded_total),
             "downloaded": downloaded_total,
-            "todo_count": sum(1 for e in entries if e.get("status") in ("todo_cd", "flagged_cover") and not e.get("owned_from_cd")),
+            "todo_count": todo_cnt,
             "errors": errors,
         }
 
@@ -1102,10 +1316,11 @@ class AnimeCatalogManager:
         include_singles: bool = True,
         max_album_tracks: int = 6,
         skip_already_scanned: bool = False,
+        strict_versions: bool = True,
         cancel_event=None,
         progress_callback=None,
     ) -> dict[str, Any]:
-        """One-click autopilot: scan wikis & singles -> verify official artists on JioSaavn -> download -> create folders & CD To-Do lists."""
+        """One-click autopilot across 1 or all 83 anime series (never stops on a single anime error)."""
         os.makedirs(out_folder, exist_ok=True)
         total = len(slugs)
         completed: list[dict[str, Any]] = []
@@ -1113,9 +1328,15 @@ class AnimeCatalogManager:
         total_todo = 0
         cancelled = False
 
+        log_event(
+            "AUTOPILOT",
+            f"Starting autopilot for {total} series -> {out_folder} (include_singles={include_singles}, max_tracks={max_album_tracks}, strict={strict_versions})",
+        )
+
         for idx, slug in enumerate(slugs, start=1):
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
+                log_event("AUTOPILOT", "Stop requested by user — saving progress.", level="WARN")
                 break
 
             franchise = FRANCHISE_BY_SLUG.get(slug)
@@ -1123,57 +1344,74 @@ class AnimeCatalogManager:
                 continue
 
             base_pct = int(100 * (idx - 1) / max(1, total))
-            rec = (self._db.get("animes") or {}).get(slug) or {}
-            already_scanned = bool(rec.get("entries"))
+            try:
+                rec = (self._db.get("animes") or {}).get(slug) or {}
+                already_scanned = bool(rec.get("entries"))
 
-            if not (skip_already_scanned and already_scanned):
+                if not (skip_already_scanned and already_scanned):
+                    if progress_callback:
+                        progress_callback(
+                            f"[{idx}/{total}] {franchise.name}: finding playlists, wikis, 3000px covers & checking JioSaavn...",
+                            base_pct,
+                        )
+                    self.scan_anime(
+                        slug,
+                        check_saavn=True,
+                        enrich_itunes=True,
+                        strict_versions=strict_versions,
+                        progress_callback=lambda done, tot, f=franchise, i=idx: (
+                            progress_callback(
+                                f"[{i}/{total}] {f.name}: verifying singles & JioSaavn ({done}/{tot})...",
+                                min(99, int(100 * ((i - 1) + 0.7 * (done / max(1, tot))) / max(1, total))),
+                            )
+                            if progress_callback
+                            else None
+                        ),
+                    )
+                else:
+                    log_event("AUTOPILOT", f"[{idx}/{total}] {franchise.name}: skipping scan (already scanned)")
+
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
+
                 if progress_callback:
                     progress_callback(
-                        f"[{idx}/{total}] {franchise.name}: finding OPs/EDs/Movies, 3000px covers & checking JioSaavn...",
-                        base_pct,
+                        f"[{idx}/{total}] {franchise.name}: downloading verified JioSaavn tracks & creating folder...",
+                        min(99, int(100 * ((idx - 1) + 0.85) / max(1, total))),
                     )
-                self.scan_anime(
+
+                res = self.download_anime_entries(
                     slug,
-                    check_saavn=True,
-                    enrich_itunes=True,
-                    progress_callback=lambda done, tot, f=franchise, i=idx: (
-                        progress_callback(
-                            f"[{i}/{total}] {f.name}: verifying singles & JioSaavn ({done}/{tot})...",
-                            min(99, int(100 * ((i - 1) + 0.7 * (done / max(1, tot))) / max(1, total))),
-                        )
-                        if progress_callback
-                        else None
-                    ),
+                    out_folder=out_folder,
+                    include_singles=include_singles,
+                    max_album_tracks=max_album_tracks,
                 )
-
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
-
-            if progress_callback:
-                progress_callback(
-                    f"[{idx}/{total}] {franchise.name}: downloading verified JioSaavn tracks & creating folder...",
-                    min(99, int(100 * ((idx - 1) + 0.8) / max(1, total))),
+                total_downloaded += res["downloaded_count"]
+                total_todo += res["todo_count"]
+                completed.append(
+                    {
+                        "slug": slug,
+                        "name": franchise.name,
+                        "folder_path": res["folder_path"],
+                        "downloaded_count": res["downloaded_count"],
+                        "todo_count": res["todo_count"],
+                        "errors": len(res["errors"]),
+                    }
                 )
-
-            res = self.download_anime_entries(
-                slug,
-                out_folder=out_folder,
-                include_singles=include_singles,
-                max_album_tracks=max_album_tracks,
-            )
-            total_downloaded += res["downloaded_count"]
-            total_todo += res["todo_count"]
-            completed.append(
-                {
-                    "slug": slug,
-                    "name": franchise.name,
-                    "folder_path": res["folder_path"],
-                    "downloaded_count": res["downloaded_count"],
-                    "todo_count": res["todo_count"],
-                    "errors": len(res["errors"]),
-                }
-            )
+            except Exception as exc:
+                log_event("ERROR", f"[{idx}/{total}] {franchise.name} failed (continuing to next series): {exc}", level="ERROR")
+                completed.append(
+                    {
+                        "slug": slug,
+                        "name": franchise.name,
+                        "folder_path": "",
+                        "downloaded_count": 0,
+                        "todo_count": 0,
+                        "errors": 1,
+                        "error_message": str(exc),
+                    }
+                )
 
         # Write Master CD To-Do list & Master Directory Index into out_folder
         master_todo_path = os.path.join(out_folder, "ALL_ANIMES_CD_TODO.md")
@@ -1198,6 +1436,11 @@ class AnimeCatalogManager:
         idx_lines.append("")
         with open(dir_index_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(idx_lines))
+
+        log_event(
+            "AUTOPILOT",
+            f"Completed {len(completed)}/{total} series | Downloaded: {total_downloaded} | CD To-Do: {total_todo} | Index: {dir_index_path}",
+        )
 
         if progress_callback:
             progress_callback(

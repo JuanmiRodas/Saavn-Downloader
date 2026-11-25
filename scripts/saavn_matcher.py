@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 import requests
 
+from .activity_log import log_event
 from .reference_checker import (
     ReferenceSong,
     _artist_matches,
@@ -316,21 +317,30 @@ class SaavnMatcher:
         duration_ms: int = 0,
         reference: ReferenceSong | None = None,
         allow_instrumental: bool = False,
+        strict_versions: bool = True,
     ) -> tuple[SaavnMatch | None, str]:
         """Search JioSaavn and return (verified_match, diagnostic_note).
 
-        Strictly rejects covers, karaoke, lofi, piano, remixes, live, slowed/nightcore,
-        TV-size cuts, alternate versions, and wrong artists.
+        Always rejects covers, karaoke, lofi, piano, and wrong artists.
+        When strict_versions=True (default), also rejects remixes, live, slowed/nightcore,
+        TV-size cuts, and duration mismatches (>40s).
         """
         queries = self._build_queries(title, artists, reference=reference)
         candidates_by_id: dict[str, SaavnMatch] = {}
         for q in queries:
-            for cand in self.search_songs(q, limit=6):
+            hits = self.search_songs(q, limit=6)
+            for cand in hits:
                 if cand.song_id and cand.song_id not in candidates_by_id:
                     candidates_by_id[cand.song_id] = cand
 
         if not candidates_by_id:
+            log_event("SAAVN", f"'{title}' ({', '.join(artists[:2])}) | queries={queries} -> 0 raw results on JioSaavn")
             return None, "No search results returned by JioSaavn"
+
+        raw_preview = ", ".join(
+            f"'{c.title}' ({', '.join(c.artists[:2]) or '?'})"
+            for c in list(candidates_by_id.values())[:3]
+        )
 
         expected_titles = [title, strip_title_annotations(title)]
         expected_artists = list(artists)
@@ -353,6 +363,7 @@ class SaavnMatcher:
         rejection_reasons: list[str] = []
 
         target_sec = duration_ms // 1000 if duration_ms else 0
+        min_title_score = 0.76 if strict_versions else 0.68
 
         for cand in candidates_by_id.values():
             # 1. Reject obvious covers / karaoke / lofi / piano / instrumental
@@ -369,17 +380,18 @@ class SaavnMatcher:
                 continue
 
             # 2. Reject alternate versions (remix, live, slowed, acoustic, TV-size, dub) unless expected
-            cand_blob = f"{cand.title} {cand.album}"
-            alt_rejected = False
-            for pat, kw, reason in alt_version_checks:
-                if pat.search(cand_blob) and kw not in expected_blob:
-                    rejection_reasons.append(f"Rejected '{cand.title}': {reason}")
-                    alt_rejected = True
-                    break
-            if alt_rejected:
-                continue
+            if strict_versions:
+                cand_blob = f"{cand.title} {cand.album}"
+                alt_rejected = False
+                for pat, kw, reason in alt_version_checks:
+                    if pat.search(cand_blob) and kw not in expected_blob:
+                        rejection_reasons.append(f"Rejected '{cand.title}': {reason}")
+                        alt_rejected = True
+                        break
+                if alt_rejected:
+                    continue
 
-            # 3. Title similarity (strict)
+            # 3. Title similarity
             cand_title_variants = [cand.title, strip_title_annotations(cand.title)]
             title_score = 0.0
             for ct in cand_title_variants:
@@ -387,10 +399,10 @@ class SaavnMatcher:
                     if ct and et:
                         title_score = max(title_score, _similarity(ct, et))
 
-            if title_score < 0.78:
+            if title_score < min_title_score:
                 continue
 
-            # 4. Artist verification (must match original official artist!)
+            # 4. Artist verification (must ALWAYS match official artist — never accept covers/fake artists!)
             cand_artists = list(dict.fromkeys([*cand.artists, *cand.singers]))
             artist_ok, artist_score = _artist_matches(cand_artists, expected_artists)
             if not artist_ok:
@@ -399,11 +411,11 @@ class SaavnMatcher:
                 )
                 continue
 
-            # 5. Duration verification (reject mismatched-length edits/TV-size/live cuts)
+            # 5. Duration verification
             dur_bonus = 0.0
             if target_sec >= 90 and cand.duration_sec > 0:
                 diff = abs(cand.duration_sec - target_sec)
-                if diff > 40:
+                if strict_versions and diff > 40:
                     rejection_reasons.append(
                         f"Rejected '{cand.title}': duration mismatch ({cand.duration_sec}s vs official {target_sec}s)"
                     )
@@ -424,14 +436,23 @@ class SaavnMatcher:
                 best_match = cand
 
         if best_match is None:
+            detail = rejection_reasons[0] if rejection_reasons else "no title/artist match"
+            log_event(
+                "SAAVN",
+                f"'{title}' ({', '.join(artists[:2])}) | {len(candidates_by_id)} raw [{raw_preview}] -> 0 official matches ({detail})",
+                level="WARN",
+            )
             if rejection_reasons:
                 return None, f"Only unverified/cover/alternate versions on JioSaavn ({rejection_reasons[0]})"
             return None, "No verified original recording found on JioSaavn"
 
-        # Check verified badge on JioSaavn artist profile if primary artist ID is available
         artist_map = (best_match.raw.get("more_info") or {}).get("artistMap") or {}
         primary_objs = artist_map.get("primary_artists") or []
         if primary_objs and primary_objs[0].get("id"):
             best_match.artist_verified = self.check_artist_verified(str(primary_objs[0]["id"]))
 
+        log_event(
+            "MATCH",
+            f"'{title}' -> JioSaavn '{best_match.title}' by {', '.join(best_match.artists)} (score={best_match.match_score}, 320={best_match.is_320kbps})",
+        )
         return best_match, "Verified original JioSaavn match"
